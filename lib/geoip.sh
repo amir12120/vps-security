@@ -131,7 +131,17 @@ geo_remove_countries() {
     if [ -n "$GEO_COUNTRIES" ]; then
         ok "Countries now allowed: $(echo "$GEO_COUNTRIES" | tr ',' ' ')"
     else
-        ok "No countries configured — geo filtering is effectively off."
+        # SAFETY: the last country was removed. If filtering is still
+        # active, disable it completely RIGHT NOW (rules, timer, ipset)
+        # so the server stays reachable from everywhere. Even bypass IPs
+        # must not keep a world-DROP alive with zero allowed countries.
+        if geo_enabled; then
+            geo_disable
+            ok "Last country removed — geo filter DISABLED automatically."
+            ok "The server is open to ALL countries again."
+        else
+            ok "No countries configured — geo filtering is effectively off."
+        fi
     fi
     return 0
 }
@@ -216,6 +226,21 @@ geo_ipset_rebuild() {
 
 # ---------- before.rules block ----------
 
+# ---------- safety invariant ----------
+# The final-DROP rule must only ever be installed when the allow-set can
+# actually contain addresses (at least one non-empty country list, or at
+# least one bypass IP). Otherwise a config mistake or a failed download
+# would DROP THE WHOLE WORLD including the administrator's SSH session.
+geo_ruleset_is_safe() {
+    load_geo_conf
+    [ -n "${GEO_BYPASS:-}" ] && return 0
+    local cc
+    for cc in $(echo "${GEO_COUNTRIES:-}" | tr ',' ' '); do
+        [ -s "$GEO_DIR/$cc.cidr" ] && return 0
+    done
+    return 1
+}
+
 geo_rules_text() {
     local bypass=() ip
     [ -n "$GEO_BYPASS" ] && IFS=',' read -ra bypass <<< "$GEO_BYPASS"
@@ -234,10 +259,31 @@ EOF
 }
 
 geo_write_rules() {
+    # SAFETY: never install a world-blocking ruleset with an empty allow-set
+    if ! geo_ruleset_is_safe; then
+        err "Refusing to enable geo blocking: no country ranges available and no bypass IPs."
+        err "The firewall was NOT modified — access from everywhere stays open."
+        return 1
+    fi
     [ -f "$BEFORE_RULES" ] || { err "$BEFORE_RULES not found (is ufw installed?)"; return 1; }
     sed -i "/^${MARK_BEGIN}\$/,/^${MARK_END}\$/d" "$BEFORE_RULES"
     printf '\n%s\n' "$(geo_rules_text)" >> "$BEFORE_RULES"
     return 0
+}
+
+# Remove the geo rules block if present (used when the ruleset is unsafe)
+geo_strip_if_unsafe() {
+    if ! geo_ruleset_is_safe; then
+        geo_remove_rules
+        cmd_ipset destroy "$IPSET_NAME" 2>/dev/null || true
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -q active; then
+            cmd_ufw reload >/dev/null 2>&1 || true
+        fi
+        printf '%s SAFETY allow-set empty — geo rules removed, server open to all\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" >> "$GEO_LOG"
+        return 0
+    fi
+    return 1
 }
 
 geo_remove_rules() {
@@ -250,16 +296,32 @@ geo_remove_rules() {
 
 geo_enable() {
     load_geo_conf
-    [ -z "$GEO_COUNTRIES" ] && die "Add at least one country first (geoip.sh --add IR,DE)."
+    # SAFETY: with no countries configured the filter must simply never be
+    # enabled — the server stays reachable from anywhere in the world.
+    if [ -z "${GEO_COUNTRIES:-}" ]; then
+        warn "No countries configured — geo filtering is NOT enabled."
+        info "The server remains accessible from ALL countries."
+        info "Add countries first:  geoip.sh --add IR,DE   (or via the CLI Geo menu)."
+        return 0
+    fi
     ensure_dirs
     if ! have_ipset; then
         info "Installing ipset..."
         apt-get install -y ipset >/dev/null 2>&1 || true
     fi
     have_ipset || die "ipset is required but not installed (apt-get install -y ipset)."
+
     # ensure ipset present after reboot: install a restore service
     geo_download || true
     geo_ipset_rebuild || die "ipset rebuild failed."
+    # SAFETY: if the downloads failed, every allow-set is empty. Never write
+    # the world-DROP rule in that state.
+    if ! geo_ruleset_is_safe; then
+        geo_strip_if_unsafe || true
+        err "Country lists are empty (download failed?) — geo filtering NOT enabled."
+        err "The server remains accessible from ALL countries. Fix internet access and re-run --enable."
+        return 1
+    fi
     geo_write_rules || die "writing ufw rules failed."
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -q active; then
         cmd_ufw reload >/dev/null 2>&1 || true
@@ -361,7 +423,10 @@ geo_refresh() {
     geo_enabled || return 0
     info "Refreshing country lists..."
     geo_download || true
-    geo_ipset_rebuild || true
+    # SAFETY: never leave a world-DROP active while the allow-set is empty
+    # (e.g. all refresh downloads failed). Strip the geo rules instead so
+    # the server stays reachable.
+    geo_strip_if_unsafe || geo_ipset_rebuild || true
     return 0
 }
 
@@ -373,7 +438,17 @@ case "${1:-}" in
     --disable) need_root; geo_disable ;;
     --bypass) shift; geo_bypass "${1:-}" "${2:-}" ;;
     --refresh) need_root; geo_refresh ;;
-    --ipset-restore) geo_ipset_rebuild; geo_write_rules 2>/dev/null || true ;;
+    --ipset-restore)
+        # SAFETY at boot: if the on-disk config is unsafe (no countries /
+        # empty lists / no bypass), remove any geo rules so the server is
+        # never left blocked from the whole world after a reboot.
+        if ! geo_ruleset_is_safe; then
+            geo_strip_if_unsafe || true
+            exit 0
+        fi
+        geo_ipset_rebuild || true
+        geo_write_rules 2>/dev/null || true
+        ;;
     --health) geo_enabled ;;
     *) die "usage: geoip.sh (--add <CC,..>|--remove <CC,..>|--list|--enable|--disable|--bypass|--refresh|--health)" ;;
 esac

@@ -367,6 +367,61 @@ check "geo disable strips rules"        "! grep -q 'vps-security geoip BEGIN' '$
 check "geo disable clears conf"         "grep -q 'GEO_ENABLED=0' '$VPSSEC_CONF_DIR/geo.conf'"
 
 echo
+echo "=== smoke: GeoIP safety — server must stay open when no countries are set ==="
+# a) enable with NO countries configured -> refuse, write nothing, stay open
+printf 'GEO_ENABLED=0\nGEO_COUNTRIES=\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --enable > "$SANDBOX/geosafe1.out" 2>&1 || true
+check "geo enable w/o countries refuses"    "grep -q 'NOT enabled' '$SANDBOX/geosafe1.out'"
+check "geo enable w/o countries: no rules"  "! grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
+check "geo enable w/o countries: stays off" "! grep -q '^GEO_ENABLED=1$' '$VPSSEC_CONF_DIR/geo.conf'"
+
+# b) countries configured but ALL downloads fail -> refuse, no world-DROP
+printf 'GEO_ENABLED=0\nGEO_COUNTRIES=IR,DE\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+rm -f "$VPSSEC_STATE_DIR"/geo/*.cidr 2>/dev/null
+cat > "$STUBS/curl" <<'CEOF2'
+#!/usr/bin/env bash
+exit 1
+CEOF2
+chmod +x "$STUBS/curl"
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --enable > "$SANDBOX/geosafe2.out" 2>&1 || true
+check "geo enable w/ failed downloads refuses" "grep -q 'NOT enabled' '$SANDBOX/geosafe2.out'"
+check "failed downloads write no DROP rule"    "! grep -q -- '-A ufw-before-input -j DROP' '$UFW_DIR/before.rules'"
+
+# c) removing the LAST country while enabled -> auto-disable + rules stripped
+cat > "$STUBS/curl" <<'CEOF3'
+#!/usr/bin/env bash
+out="/dev/null"; prev=""
+for a in "\$@"; do case "\$prev" in -o) out="\$a";; esac; prev="\$a"; done
+printf '1.2.3.0/24\n' > "\$out"
+exit 0
+CEOF3
+chmod +x "$STUBS/curl"
+printf 'GEO_ENABLED=0\nGEO_COUNTRIES=IR\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+printf '1.2.3.0/24\n' > "$VPSSEC_STATE_DIR/geo/IR.cidr"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --enable > /dev/null 2>&1 || true
+check "geo re-enabled for safety test"      "grep -q '^GEO_ENABLED=1$' '$VPSSEC_CONF_DIR/geo.conf'"
+check "geo DROP rule active before remove"  "grep -q -- '-A ufw-before-input -j DROP' '$UFW_DIR/before.rules'"
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --remove "ir" > "$SANDBOX/geosafe3.out" 2>&1 || true
+check "last-country remove auto-disables"   "grep -q '^GEO_ENABLED=0$' '$VPSSEC_CONF_DIR/geo.conf'"
+check "last-country remove strips rules"    "! grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
+check "last-country remove message shown"   "grep -q 'open to ALL countries' '$SANDBOX/geosafe3.out'"
+
+# d) boot restore with unsafe config must never re-apply a world-DROP
+printf 'GEO_ENABLED=1\nGEO_COUNTRIES=ZZ\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+rm -f "$VPSSEC_STATE_DIR/geo/ZZ.cidr"
+{ echo ""; echo "# --- vps-security geoip BEGIN ---"; echo "-A ufw-before-input -j DROP"; echo "# --- vps-security geoip END ---"; } >> "$UFW_DIR/before.rules"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --ipset-restore > /dev/null 2>&1 || true
+check "boot restore strips unsafe geo rules" "! grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
+# ...and keeps/rewrites them when the config is safe
+printf 'GEO_ENABLED=1\nGEO_COUNTRIES=IR\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+printf '1.2.3.0/24\n' > "$VPSSEC_STATE_DIR/geo/IR.cidr"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --ipset-restore > /dev/null 2>&1 || true
+check "boot restore keeps safe geo rules"    "grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
+
+echo
 echo "=== smoke: new menu commands present ==="
 printf '10\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menushield.out" 2>&1 || true
 check "menu shows shield entry"         "grep -q 'Bot & Scanner Shield' '$SANDBOX/menushield.out'"
