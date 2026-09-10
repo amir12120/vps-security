@@ -28,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
 REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
 REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"

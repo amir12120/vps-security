@@ -318,7 +318,7 @@ check "empty-ports install removes stale allow-list" "[ ! -f '$VPSSEC_CONF_DIR/a
 
 echo
 echo "=== smoke: help & version ==="
-bash "$HERE/vpssec" version | grep -q 'vpssec 1.2.0' && R=0 || R=1
+bash "$HERE/vpssec" version | grep -q 'vpssec 1.2.1' && R=0 || R=1
 check "version reports 1.2.0"           "[ \"$R\" -eq 0 ]"
 bash "$HERE/vpssec" help | grep -q 'update' && R=0 || R=1
 check "help mentions update"            "[ \"$R\" -eq 0 ]"
