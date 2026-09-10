@@ -115,6 +115,12 @@ Direct commands: `vpssec geo add IR,DE` · `vpssec geo remove TR` · `vpssec geo
 
 > ⚠️ Enable GeoIP filtering **after** confirming your SSH connectivity, and add your own IP as a bypass if you connect from a country you did not whitelist.
 
+> 🛡️ **Built-in safety — you can never lock the whole world out by accident:**
+> - If **no countries are configured**, enabling the filter is refused and the server stays reachable from **everywhere**.
+> - If every country-list **download fails**, the blocking rules are never installed.
+> - **Removing the last allowed country** while filtering is active automatically disables the filter and re-opens the server to all countries.
+> - **At boot**, an unsafe config (no countries / empty lists / no bypass) never re-applies the world-DROP rule.
+
 ## Guard API (local status endpoint)
 
 The optional guard service serves monitor state on `127.0.0.1:18080`:
