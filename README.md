@@ -8,6 +8,8 @@
 2. **SSH port change** — moves SSH off port 22 to a port you choose (with automatic rollback if sshd fails to come back)
 3. **Firewall (ufw)** — installs ufw, opens **only** the ports you approve, and enables it
 4. **Rogue-port monitor** — every 30 minutes scans live connections; any port **not** in your allow-list that is actively transferring data gets **blocked via ufw for 1 hour**, then automatically released
+5. **Bot & Scanner Shield** — per-IP connection rate limits, TCP-flag scan drops (NULL / SYN+FIN / SYN+RST / ALL), and auto-ban of SYN-flooding IPs for one hour
+6. **GeoIP country filter** — allow **any number of countries** you choose (e.g. only Iran and Germany) and block every other country from reaching the server
 
 ---
 
@@ -26,7 +28,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.1.0 — server hardening toolkit
+  vps-security v1.2.0 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────
@@ -39,6 +41,8 @@ sudo vpssec
     🔓 Unblock a port
     📜 Monitor logs
     ⬆️  Update vps-security
+    🛡️  Bot & Scanner Shield
+    🌍 GeoIP country filter
     🗑️  Uninstall vps-security
     🚪 Exit
 ```
@@ -55,6 +59,8 @@ Navigate with **↑/↓** (or `j`/`k`), select with **Enter**, go back with **q*
 | `sudo vpssec blocked` | View blocked ports + time until auto-release |
 | `sudo vpssec unblock [port]` | Release a blocked port immediately |
 | `sudo vpssec update` | Update vps-security from GitHub (`git pull` in place) |
+| `sudo vpssec shield status` | Bot & Scanner Shield state + banned IPs |
+| `sudo vpssec geo list` | GeoIP filter configuration |
 | `sudo vpssec logs [n]` | Show monitor log |
 | `sudo vpssec uninstall` | Remove vps-security (ufw rules are kept) |
 
@@ -83,6 +89,29 @@ Navigate with **↑/↓** (or `j`/`k`), select with **Enter**, go back with **q*
 | `/var/lib/vps-security/*.log` | Monitor and block logs |
 | `/etc/systemd/system/vps-security-monitor.{service,timer}` | Scanner units |
 | `/etc/systemd/system/vps-security-guard.service` | Local status API |
+
+## Bot & Scanner Shield
+
+Enable it from the **🛡️ Bot & Scanner Shield** menu (or `vpssec shield enable`):
+
+- **Rate limiting** — ufw `limit` rules on SSH and every protected port: more than **6 new connections per 30 s** from one IP are dropped (this kills port scanners and brute-force bots)
+- **TCP-flag drops** — NULL scans, SYN+FIN, SYN+RST, and ALL-flags packets are dropped in ufw's `before.rules` (survives reboots and ufw reloads)
+- **Auto-ban** — an IP flooding a protected port with half-open connections (40+ SYN-RECV) is banned via `ufw deny from <ip>` for **one hour**; bans expire automatically (10-minute maintenance timer)
+- Manage banned IPs from the same menu: view the list with remaining time, or unban any IP instantly
+
+## GeoIP country filter
+
+From the **🌍 GeoIP country filter** menu (or `vpssec geo ...`):
+
+1. **➕ Add allowed countries** — enter any number of 2-letter codes: `IR,DE,TR,US` … the list is unlimited
+2. **✅ Enable filtering** — downloads each country's IPv4 CIDR list (IPFire location database, updated daily), loads them into an **ipset**, and wires ufw so that *only* those countries can reach the server — everyone else is dropped
+3. **🛟 Bypass** — add your own IP so it is never geo-blocked, even from a blocked country (the menu shows your current public IP)
+4. **♻️ Refresh** — country lists refresh automatically every week; refresh manually any time
+5. **⛔ Disable** — removes all geo rules instantly; everyone can connect again
+
+Direct commands: `vpssec geo add IR,DE` · `vpssec geo remove TR` · `vpssec geo list` · `vpssec geo enable|disable` · `vpssec geo bypass <ip>` · `vpssec geo refresh`
+
+> ⚠️ Enable GeoIP filtering **after** confirming your SSH connectivity, and add your own IP as a bypass if you connect from a country you did not whitelist.
 
 ## Guard API (local status endpoint)
 

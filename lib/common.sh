@@ -41,6 +41,8 @@ is_valid_port() {
 VPSSEC_CONF_DIR="${VPSSEC_CONF_DIR:-/etc/vps-security}"
 VPSSEC_STATE_DIR="${VPSSEC_STATE_DIR:-/var/lib/vps-security}"
 VPSSEC_SYSTEMD_DIR="${VPSSEC_SYSTEMD_DIR:-/etc/systemd/system}"
+# Where generated ufw 'before' rules live (overridable for sandbox tests)
+UFW_DIR="${UFW_DIR:-/etc/ufw}"
 MONITOR_CONF="$VPSSEC_CONF_DIR/monitor.conf"
 ALLOWED_PORTS_CONF="$VPSSEC_CONF_DIR/allowed-ports.list"
 BLOCK_LIST_FILE="$VPSSEC_STATE_DIR/blocked-ports.list"

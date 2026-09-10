@@ -28,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
 REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
 REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"
@@ -365,6 +365,28 @@ EOF
 
     install_systemd "$current_port" "$guard_port"
 
+    # ------------------------------------------------
+    # Step 5 — optional shields
+    # ------------------------------------------------
+    echo
+    echo "Step 5/5 — Bot shield & GeoIP filter (optional)"
+    if read_confirm "Enable the Bot & Scanner Shield (rate limits + auto-ban)? [Y/n] "; then
+        "$SCRIPT_DIR/lib/botshield.sh" --enable || true
+    else
+        info "You can enable it later from the menu (Bot & Scanner Shield)."
+    fi
+    if read_confirm "Restrict server access by country (GeoIP filter)? [y/N] " "n"; then
+        local cc_in
+        prompt "  Country codes, comma-separated (e.g. IR,DE): "
+        read -r cc_in
+        if [ -n "$cc_in" ]; then
+            "$SCRIPT_DIR/lib/geoip.sh" --add "$cc_in" || true
+            "$SCRIPT_DIR/lib/geoip.sh" --enable || true
+        fi
+    else
+        info "You can set it up later from the menu (GeoIP country filter)."
+    fi
+
     echo
     echo "=============================================="
     ok "vps-security setup complete!"
@@ -468,6 +490,18 @@ cmd_status() {
         printf "  ${RED}●${RESET} Blocked ports   : %s\n" "$blocked_n"
     else
         printf "  ${GREEN}●${RESET} Blocked ports   : 0\n"
+    fi
+    if bash "$SCRIPT_DIR/lib/botshield.sh" --health 2>/dev/null; then
+        printf "  ${GREEN}●${RESET} Bot shield      : active\n"
+    else
+        printf "  ${DIM}●${RESET} Bot shield      : off\n"
+    fi
+    if bash "$SCRIPT_DIR/lib/geoip.sh" --health 2>/dev/null; then
+        local geo_ccs
+        geo_ccs="$(grep '^GEO_COUNTRIES=' "$VPSSEC_CONF_DIR/geo.conf" 2>/dev/null | cut -d= -f2)"
+        printf "  ${GREEN}●${RESET} GeoIP filter    : active (%s)\n" "${geo_ccs:-(no countries)}"
+    else
+        printf "  ${DIM}●${RESET} GeoIP filter    : off\n"
     fi
 
     echo
@@ -744,9 +778,15 @@ cmd_uninstall() {
         return 0
     fi
     $SYSTEMCTL disable --now vps-security-monitor.timer 2>/dev/null || true
+    $SYSTEMCTL disable --now vps-security-shield.timer 2>/dev/null || true
+    $SYSTEMCTL disable --now vps-security-geo.timer 2>/dev/null || true
     $SYSTEMCTL stop vps-security-guard.service 2>/dev/null || true
+    "$SCRIPT_DIR/lib/botshield.sh" --disable >/dev/null 2>&1 || true
+    "$SCRIPT_DIR/lib/geoip.sh" --disable >/dev/null 2>&1 || true
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-monitor.{service,timer}
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-guard.service
+    rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-shield.{service,timer}
+    rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-geo.{service,timer}
     $SYSTEMCTL daemon-reload
     rm -rf "$INSTALL_DIR"
     rm -f /usr/local/bin/vpssec
@@ -773,6 +813,8 @@ show_menu() {
             "🔓 Unblock a port" \
             "📜 Monitor logs" \
             "⬆️  Update vps-security" \
+            "🛡️  Bot & Scanner Shield" \
+            "🌍 GeoIP country filter" \
             "🗑️  Uninstall vps-security" \
             "🚪 Exit"
         case "$MENU_IDX" in
@@ -785,10 +827,133 @@ show_menu() {
             7) action_unblock; ui_press_any_key ;;
             8) cmd_logs; ui_press_any_key ;;
             9) cmd_update; ui_press_any_key ;;
-            10) cmd_uninstall; ui_press_any_key ;;
-            0|11) exit 0 ;;
+            10) action_shield_menu ;;
+            11) action_geo_menu ;;
+            12) cmd_uninstall; ui_press_any_key ;;
+            0|13) exit 0 ;;
         esac
     done
+}
+
+# ============================================================
+# Bot & Scanner Shield
+# ============================================================
+
+action_shield_menu() {
+    while :; do
+        ui_menu "Bot & Scanner Shield" \
+            "✅ Enable the shield" \
+            "⛔ Disable the shield" \
+            "📊 Shield status and banned IPs" \
+            "🔓 Unban an IP now" \
+            "🚪 Back"
+        case "$MENU_IDX" in
+            1) bash "$SCRIPT_DIR/lib/botshield.sh" --enable; ui_press_any_key ;;
+            2) bash "$SCRIPT_DIR/lib/botshield.sh" --disable; ui_press_any_key ;;
+            3) bash "$SCRIPT_DIR/lib/botshield.sh" --status; ui_press_any_key ;;
+            4) action_shield_unban; ui_press_any_key ;;
+            0|5) return 0 ;;
+        esac
+    done
+}
+
+action_shield_unban() {
+    ui_title "Unban an IP"
+    local n=0 ips=() ts ip
+    if [ -f "$VPSSEC_STATE_DIR/shield-bans.list" ] && [ -s "$VPSSEC_STATE_DIR/shield-bans.list" ]; then
+        while IFS='|' read -r ts ip || [ -n "${ts:-}" ]; do
+            [ -z "${ts:-}" ] && continue
+            n=$((n + 1)); ips+=("$ip")
+            printf "  %2d) %s\n" "$n" "$ip"
+        done < "$VPSSEC_STATE_DIR/shield-bans.list"
+    fi
+    [ "$n" -eq 0 ] && { info "No banned IPs."; return 0; }
+    prompt "Number of the IP to unban (empty = cancel): "
+    read -r idx
+    [ -z "$idx" ] && return 0
+    case "$idx" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$idx" -lt 1 ] || [ "$idx" -gt "$n" ] && return 0
+    bash "$SCRIPT_DIR/lib/botshield.sh" --unban "${ips[$((idx - 1))]}"
+}
+
+cmd_shield() {
+    case "${1:-status}" in
+        enable)  need_root; bash "$SCRIPT_DIR/lib/botshield.sh" --enable "${2:-}" ;;
+        disable) need_root; bash "$SCRIPT_DIR/lib/botshield.sh" --disable ;;
+        unban)   need_root; bash "$SCRIPT_DIR/lib/botshield.sh" --unban "${2:-}" ;;
+        status)  bash "$SCRIPT_DIR/lib/botshield.sh" --status ;;
+        *)       bash "$SCRIPT_DIR/lib/botshield.sh" --status ;;
+    esac
+}
+
+# ============================================================
+# GeoIP country filter
+# ============================================================
+
+action_geo_menu() {
+    while :; do
+        ui_menu "GeoIP Country Filter" \
+            "➕ Add allowed countries" \
+            "➖ Remove allowed countries" \
+            "📋 Show configuration" \
+            "✅ Enable filtering" \
+            "⛔ Disable filtering" \
+            "🛟 Never block an IP (bypass)" \
+            "♻️  Refresh country lists" \
+            "🚪 Back"
+        case "$MENU_IDX" in
+            1) action_geo_add; ui_press_any_key ;;
+            2) action_geo_remove; ui_press_any_key ;;
+            3) bash "$SCRIPT_DIR/lib/geoip.sh" --list; ui_press_any_key ;;
+            4) bash "$SCRIPT_DIR/lib/geoip.sh" --enable; ui_press_any_key ;;
+            5) bash "$SCRIPT_DIR/lib/geoip.sh" --disable; ui_press_any_key ;;
+            6) action_geo_bypass; ui_press_any_key ;;
+            7) bash "$SCRIPT_DIR/lib/geoip.sh" --refresh; ui_press_any_key ;;
+            0|8) return 0 ;;
+        esac
+    done
+}
+
+action_geo_add() {
+    ui_title "Add Allowed Countries"
+    info "Enter 2-letter country codes, comma-separated."
+    info "Examples: IR (Iran), DE (Germany), US, TR, AE — as many as you want."
+    prompt "Countries (e.g. IR,DE): "
+    read -r ccs
+    [ -z "$ccs" ] && { info "Cancelled."; return 0; }
+    bash "$SCRIPT_DIR/lib/geoip.sh" --add "$ccs"
+}
+
+action_geo_remove() {
+    ui_title "Remove Allowed Countries"
+    bash "$SCRIPT_DIR/lib/geoip.sh" --list
+    prompt "Country codes to remove (e.g. TR): "
+    read -r ccs
+    [ -z "$ccs" ] && { info "Cancelled."; return 0; }
+    bash "$SCRIPT_DIR/lib/geoip.sh" --remove "$ccs"
+}
+
+action_geo_bypass() {
+    ui_title "Bypass — Never Geo-block an IP"
+    info "Your current public IP: $(curl -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || echo unknown)"
+    info "This IP will always be allowed, even from a blocked country."
+    prompt "IP or CIDR to always allow (empty = cancel): "
+    read -r ip
+    [ -z "$ip" ] && { info "Cancelled."; return 0; }
+    bash "$SCRIPT_DIR/lib/geoip.sh" --bypass add "$ip"
+}
+
+cmd_geo() {
+    case "${1:-list}" in
+        add)     need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --add "${2:-}" ;;
+        remove)  need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --remove "${2:-}" ;;
+        enable)  need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --enable ;;
+        disable) need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --disable ;;
+        refresh) need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --refresh ;;
+        bypass)  need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --bypass "${2:-add}" "${3:-}" ;;
+        list)    bash "$SCRIPT_DIR/lib/geoip.sh" --list ;;
+        *)       bash "$SCRIPT_DIR/lib/geoip.sh" --list ;;
+    esac
 }
 
 # ============================================================
@@ -807,6 +972,8 @@ case "${1:-}" in
     update)    cmd_update ;;
     logs)      shift; cmd_logs "$@" ;;
     uninstall) cmd_uninstall ;;
+    shield)    shift; cmd_shield "$@" ;;
+    geo)       shift; cmd_geo "$@" ;;
     help|-h|--help) cmd_help ;;
     version|--version) echo "vpssec $VERSION" ;;
     *) die "Unknown command: $1 (try 'vpssec help')" ;;

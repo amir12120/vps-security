@@ -41,11 +41,15 @@ export VPSSEC_STATE_DIR="$SANDBOX/state"
 export VPSSEC_SYSTEMD_DIR="$SANDBOX/systemd"
 export VPSSEC_INSTALL_DIR="$SANDBOX/opt/vps-security"
 export VPSSEC_SSHD_CONFIG="$SANDBOX/etc-ssh/sshd_config"
+export UFW_DIR="$SANDBOX/ufw"
+export GEO_TMP="$SANDBOX/geotmp"
 export VPSSEC_SKIP_ROOT_CHECK=1
 export VPSSEC_SKIP_OS_CHECK=1
 export PATH="$STUBS:$PATH"
 SSH_CFG="$SANDBOX/etc-ssh/sshd_config"
 trap 'rm -rf "$SANDBOX"' EXIT
+mkdir -p "$SANDBOX/ufw"
+printf '# ufw before rules stub\n*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' > "$SANDBOX/ufw/before.rules"
 
 printf '#Stub sshd_config\nPort 22\n' > "$SSH_CFG"
 
@@ -90,6 +94,7 @@ chmod +x "$STUBS/ss"
 
 # ---------- stubs: sshd / systemctl / apt-get ----------
 printf '#!/usr/bin/env bash\nexit 0\n' > "$STUBS/sshd"; chmod +x "$STUBS/sshd"
+printf '#!/usr/bin/env bash\necho "ipset $*" >> "${IPSET_LOG:-/tmp/ipset.log}"\nexit 0\n' > "$STUBS/ipset"; chmod +x "$STUBS/ipset"
 
 cat > "$STUBS/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -271,10 +276,79 @@ check "menu unblock releases port"      "grep -q 'unblocked' '$SANDBOX/menu3.out
 
 echo
 echo "=== smoke: help & version ==="
-bash "$HERE/vpssec" version | grep -q 'vpssec 1.1.0' && R=0 || R=1
-check "version reports 1.1.0"           "[ \"$R\" -eq 0 ]"
+bash "$HERE/vpssec" version | grep -q 'vpssec 1.2.0' && R=0 || R=1
+check "version reports 1.2.0"           "[ \"$R\" -eq 0 ]"
 bash "$HERE/vpssec" help | grep -q 'update' && R=0 || R=1
 check "help mentions update"            "[ \"$R\" -eq 0 ]"
+
+echo
+echo "=== smoke: Bot & Scanner Shield ==="
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --enable "" > "$SANDBOX/shield.out" 2>&1 || true
+check "shield enabled"                  "grep -q 'Shield enabled' '$SANDBOX/shield.out'"
+check "shield conf written"             "grep -q 'SHIELD_ENABLED=1' '$VPSSEC_CONF_DIR/botshield.conf'"
+check "shield ufw limit on ssh"         "grep -qE 'limit (2222)/tcp' '$SANDBOX/ufw.log'"
+check "shield timer installed"          "[ -f '$VPSSEC_SYSTEMD_DIR/vps-security-shield.timer' ]"
+check "flag drops written to before.rules" "grep -q 'vps-security botshield BEGIN' '$UFW_DIR/before.rules'"
+# ban an IP and check status/unban
+printf '%s|203.0.113.55\n' "$(date +%s)" > "$VPSSEC_STATE_DIR/shield-bans.list"
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --unban 203.0.113.55 > "$SANDBOX/unban.out" 2>&1 || true
+check "unban removes ufw deny"          "grep -q 'delete deny from 203.0.113.55' '$SANDBOX/ufw.log'"
+check "unban clears state"              "! grep -q '203.0.113.55' '$VPSSEC_STATE_DIR/shield-bans.list'"
+bash "$HERE/lib/botshield.sh" --status > "$SANDBOX/shieldstat.out" 2>&1 || true
+check "shield status shows state"       "grep -q 'Bot & Scanner Shield' '$SANDBOX/shieldstat.out'"
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --disable > /dev/null 2>&1 || true
+check "shield disable removes flag drops" "! grep -q 'vps-security botshield BEGIN' '$UFW_DIR/before.rules'"
+check "shield disable clears conf"      "grep -q 'SHIELD_ENABLED=0' '$VPSSEC_CONF_DIR/botshield.conf'"
+
+echo
+echo "=== smoke: GeoIP country filter ==="
+# sandboxed curl that returns CIDR content for any country
+mkdir -p "$GEO_TMP"
+cat > "$STUBS/curl" <<CEOF
+#!/usr/bin/env bash
+# emulate IPFire country CIDR download
+out="/dev/null"
+prev=""
+for a in "\$@"; do
+  case "\$prev" in -o) out="\$a";; esac
+  prev="\$a"
+done
+printf '1.2.3.0/24\n5.6.7.0/24\nnot-a-cidr\n' > "\$out"
+exit 0
+CEOF
+chmod +x "$STUBS/curl"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --add "ir,de,1R" > "$SANDBOX/geoadd.out" 2>&1 || true
+check "geo add normalizes codes"        "grep -q 'IR,DE' '$VPSSEC_CONF_DIR/geo.conf'"
+check "geo add rejects invalid code"    "grep -q 'not a valid' '$SANDBOX/geoadd.out'"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --enable > "$SANDBOX/geoenable.out" 2>&1 || true
+check "geo enable downloads lists"      "grep -q '^1.2.3.0/24$' '$VPSSEC_STATE_DIR/geo/IR.cidr' && grep -q '^1.2.3.0/24$' '$VPSSEC_STATE_DIR/geo/DE.cidr'"
+check "geo enable writes before.rules"  "grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
+check "geo enable writes ipset rule"    "grep -q 'match-set vpssec_geo_allow src' '$UFW_DIR/before.rules'"
+check "geo enable writes final DROP"    "grep -q -- '-A ufw-before-input -j DROP' '$UFW_DIR/before.rules'"
+check "geo enabled conf"                "grep -q 'GEO_ENABLED=1' '$VPSSEC_CONF_DIR/geo.conf'"
+check "geo bypass accepted"             "bash '$HERE/lib/geoip.sh' --bypass add 198.51.100.7 >/dev/null 2>&1 && grep -q 'GEO_BYPASS=.*198.51.100.7' '$VPSSEC_CONF_DIR/geo.conf'"
+check "geo bypass written to rules"     "grep -q -- '-s 198.51.100.7 -j ACCEPT' '$UFW_DIR/before.rules'"
+bash "$HERE/lib/geoip.sh" --list > "$SANDBOX/geolist.out" 2>&1 || true
+check "geo list shows countries"        "grep -q 'IR DE' '$SANDBOX/geolist.out'"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --remove "de" > "$SANDBOX/georem.out" 2>&1 || true
+check "geo remove keeps others"         "grep -q '^GEO_COUNTRIES=IR$' '$VPSSEC_CONF_DIR/geo.conf'"
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --disable > /dev/null 2>&1 || true
+check "geo disable strips rules"        "! grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
+check "geo disable clears conf"         "grep -q 'GEO_ENABLED=0' '$VPSSEC_CONF_DIR/geo.conf'"
+
+echo
+echo "=== smoke: new menu commands present ==="
+printf '10\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menushield.out" 2>&1 || true
+check "menu shows shield entry"         "grep -q 'Bot & Scanner Shield' '$SANDBOX/menushield.out'"
+printf '11\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menugeo.out" 2>&1 || true
+check "menu shows geo entry"            "grep -q 'GeoIP Country Filter' '$SANDBOX/menugeo.out'"
+bash "$HERE/vpssec" geo list > "$SANDBOX/geocmd.out" 2>&1 || true
+check "vpssec geo list works"           "grep -q 'GeoIP country filter' '$SANDBOX/geocmd.out'"
+bash "$HERE/vpssec" shield status > "$SANDBOX/shieldcmd.out" 2>&1 || true
+check "vpssec shield status works"      "grep -q 'Bot & Scanner Shield' '$SANDBOX/shieldcmd.out'"
 
 echo "==============================================="
 echo "SMOKE RESULT: PASS=$PASS FAIL=$FAIL"
