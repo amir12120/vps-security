@@ -1,5 +1,7 @@
 # vps-security 🛡️
 
+**English | [فارسی](README.fa.md)**
+
 **Server security hardening for Ubuntu/Debian VPS — one beautiful interactive CLI.**
 
 `vpssec` is a full TUI (arrow keys + emoji menu) that walks you through the essential first steps of securing a fresh server:
