@@ -40,6 +40,7 @@ export VPSSEC_CONF_DIR="$SANDBOX/etc"
 export VPSSEC_STATE_DIR="$SANDBOX/state"
 export VPSSEC_SYSTEMD_DIR="$SANDBOX/systemd"
 export VPSSEC_INSTALL_DIR="$SANDBOX/opt/vps-security"
+export VPSSEC_TARGET_DIR="$SANDBOX/opt/vps-security"
 export VPSSEC_SSHD_CONFIG="$SANDBOX/etc-ssh/sshd_config"
 export UFW_DIR="$SANDBOX/ufw"
 export GEO_TMP="$SANDBOX/geotmp"
@@ -302,6 +303,20 @@ printf '7\n1\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menu3.out" 2>&1 || true
 check "menu unblock releases port"      "grep -q 'unblocked' '$SANDBOX/menu3.out'"
 
 echo
+echo "=== smoke: install with NO extra ports leaves firewall OFF ==="
+# reset state from the first full install, then run install again but
+# answer NO extra ports (blank line immediately)
+rm -f "$VPSSEC_CONF_DIR/allowed-ports.list" "$VPSSEC_CONF_DIR/monitor.conf"
+rm -f "$SANDBOX/ufw.log"
+printf 'y\n3333\n\n' \
+    | UFW_LOG="$SANDBOX/ufw.log" APT_LOG="$SANDBOX/apt.log" SYSTEMCTL_LOG="$SANDBOX/systemctl.log" \
+      bash "$HERE/vpssec" install > "$SANDBOX/install2.out" 2>&1 || true
+check "empty-ports install warns firewall stays off" "grep -q 'firewall will NOT be enabled' '$SANDBOX/install2.out'"
+check "empty-ports install skips monitor"           "grep -q 'monitor skipped' '$SANDBOX/install2.out'"
+check "empty-ports install never enables ufw"       "! grep -q ' enable' '$SANDBOX/ufw.log'"
+check "empty-ports install removes stale allow-list" "[ ! -f '$VPSSEC_CONF_DIR/allowed-ports.list' ]"
+
+echo
 echo "=== smoke: help & version ==="
 bash "$HERE/vpssec" version | grep -q 'vpssec 1.2.0' && R=0 || R=1
 check "version reports 1.2.0"           "[ \"$R\" -eq 0 ]"
@@ -311,9 +326,10 @@ check "help mentions update"            "[ \"$R\" -eq 0 ]"
 echo
 echo "=== smoke: Bot & Scanner Shield ==="
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --enable "" > "$SANDBOX/shield.out" 2>&1 || true
+SP="$(grep -E '^Port ' "$SSH_CFG" | tail -1 | awk '{print $2}')"; [ -z "$SP" ] && SP=22
 check "shield enabled"                  "grep -q 'Shield enabled' '$SANDBOX/shield.out'"
 check "shield conf written"             "grep -q 'SHIELD_ENABLED=1' '$VPSSEC_CONF_DIR/botshield.conf'"
-check "shield ufw limit on ssh"         "grep -qE 'limit (2222)/tcp' '$SANDBOX/ufw.log'"
+check "shield ufw limit on ssh"         "grep -qE 'limit (${SP})/tcp' '$SANDBOX/ufw.log'"
 check "shield timer installed"          "[ -f '$VPSSEC_SYSTEMD_DIR/vps-security-shield.timer' ]"
 check "flag drops written to before.rules" "grep -q 'vps-security botshield BEGIN' '$UFW_DIR/before.rules'"
 # ban an IP and check status/unban
@@ -431,6 +447,25 @@ bash "$HERE/vpssec" geo list > "$SANDBOX/geocmd.out" 2>&1 || true
 check "vpssec geo list works"           "grep -q 'GeoIP country filter' '$SANDBOX/geocmd.out'"
 bash "$HERE/vpssec" shield status > "$SANDBOX/shieldcmd.out" 2>&1 || true
 check "vpssec shield status works"      "grep -q 'Bot & Scanner Shield' '$SANDBOX/shieldcmd.out'"
+
+echo
+echo "=== smoke: FULL uninstall — SSH to 22, ufw reset+disabled+allow 22, config wiped ==="
+rm -f "$SANDBOX/ufw.log"
+printf 'Y\n' \
+    | UFW_LOG="$SANDBOX/ufw.log" SYSTEMCTL_LOG="$SANDBOX/systemctl.log" \
+      bash "$HERE/vpssec" uninstall > "$SANDBOX/uninstall.out" 2>&1 || true
+check "uninstall resets SSH port to 22"      "grep -q '^Port 22$' '$SSH_CFG'"
+check "uninstall restarts sshd"              "grep -q 'restart sshd' '$SANDBOX/systemctl.log' || grep -q 'restart ssh' '$SANDBOX/systemctl.log'"
+check "uninstall runs ufw reset"             "grep -q -- '--force reset' '$SANDBOX/ufw.log'"
+check "uninstall allows port 22"             "grep -q 'allow 22/tcp' '$SANDBOX/ufw.log'"
+check "uninstall disables ufw"               "grep -q -- '--force disable' '$SANDBOX/ufw.log'"
+check "uninstall removes allowed-ports.list" "[ ! -f '$VPSSEC_CONF_DIR/allowed-ports.list' ]"
+check "uninstall removes monitor.conf"       "[ ! -f '$VPSSEC_CONF_DIR/monitor.conf' ]"
+check "uninstall removes geo.conf"           "[ ! -f '$VPSSEC_CONF_DIR/geo.conf' ]"
+check "uninstall removes shield conf"        "[ ! -f '$VPSSEC_CONF_DIR/botshield.conf' ]"
+check "uninstall wipes state dir"            "[ ! -d '$VPSSEC_STATE_DIR' ] || [ -z \"\$(ls -A '$VPSSEC_STATE_DIR' 2>/dev/null)\" ]"
+check "uninstall removes systemd units"      "[ ! -f '$VPSSEC_SYSTEMD_DIR/vps-security-monitor.timer' ] && [ ! -f '$VPSSEC_SYSTEMD_DIR/vps-security-geo.timer' ]"
+check "uninstall removes install dir"        "[ ! -d '$SANDBOX/opt/vps-security' ]"
 
 echo "==============================================="
 echo "SMOKE RESULT: PASS=$PASS FAIL=$FAIL"

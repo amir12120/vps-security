@@ -329,6 +329,27 @@ cmd_install() {
         ok "  $p added."
     done
 
+    # SAFETY: if the user added NO ports of their own (list = just SSH),
+    # do not enable a restrictive firewall at all — leave the system open
+    # on every port and skip the monitor (nothing to protect).
+    local user_port_count=0
+    while IFS= read -r p || [ -n "$p" ]; do
+        p="${p%%#*}"; p="$(printf '%s' "$p" | tr -d '[:space:]')"
+        [ -z "$p" ] && continue
+        [ "$p" = "$current_port" ] || user_port_count=$((user_port_count + 1))
+    done < "$ALLOWED_PORTS_CONF"
+
+    if [ "$user_port_count" -eq 0 ]; then
+        warn "No extra ports were specified — the firewall will NOT be enabled."
+        info "The server stays fully accessible on every port."
+        info "Configure ports later via the Ports menu, or re-run install."
+        rm -f "$ALLOWED_PORTS_CONF"
+        echo
+        warn "Step 4/4 — Rogue-port monitor skipped (no allow-list to protect)."
+        info "System update and SSH port changes are already applied."
+        return 0
+    fi
+
     info "Installing ufw..."
     apt-get install -y ufw >/dev/null 2>&1 || true
     ufw --force reset >/dev/null 2>&1 || true
@@ -819,27 +840,59 @@ cmd_logs() {
 cmd_uninstall() {
     need_root
     ui_title "Uninstall vps-security"
-    warn "This removes the monitor, guard service, CLI and repository copy."
-    info "Your firewall rules and SSH config are NOT touched."
+    warn "This performs a FULL cleanup:"
+    echo "  - removes the monitor, shield, guard, CLI and repository copy"
+    echo "  - removes ALL vps-security config and state files"
+    echo "  - resets the SSH port back to 22"
+    echo "  - resets and DISABLES ufw, then allows port 22 so SSH keeps working"
     echo
     if ! read_confirm "Type Y to confirm uninstall [y/N] " "n"; then
         info "Aborted."
         return 0
     fi
+
+    # 1. stop & remove everything vps-security installed
     $SYSTEMCTL disable --now vps-security-monitor.timer 2>/dev/null || true
     $SYSTEMCTL disable --now vps-security-shield.timer 2>/dev/null || true
     $SYSTEMCTL disable --now vps-security-geo.timer 2>/dev/null || true
     $SYSTEMCTL stop vps-security-guard.service 2>/dev/null || true
     "$SCRIPT_DIR/lib/botshield.sh" --disable >/dev/null 2>&1 || true
     "$SCRIPT_DIR/lib/geoip.sh" --disable >/dev/null 2>&1 || true
+
+    # 2. restore SSH to port 22 (idempotent: set_ssh_port replaces the Port line)
+    info "Restoring SSH to port 22..."
+    if [ -f "$SSH_CFG" ]; then
+        cp "$SSH_CFG" "$SSH_CFG.bak.uninstall.$(date +%s)"
+        set_ssh_port 22
+        if sshd -t 2>/dev/null; then
+            svc_restart_ssh
+            ok "SSH port restored to 22."
+        else
+            err "sshd_config validation failed — SSH port left unchanged."
+        fi
+    fi
+
+    # 3. firewall: full reset + disable, then guarantee SSH stays reachable
+    info "Resetting and disabling ufw..."
+    if command -v ufw >/dev/null 2>&1; then
+        ufw --force reset >/dev/null 2>&1 || true
+        ufw allow 22/tcp >/dev/null 2>&1 || true
+        ufw --force disable >/dev/null 2>&1 || true
+        ok "ufw reset and disabled; port 22 is allowed."
+    fi
+
+    # 4. remove units and ALL config/state
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-monitor.{service,timer}
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-guard.service
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-shield.{service,timer}
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-geo.{service,timer}
     $SYSTEMCTL daemon-reload
+    rm -rf "$VPSSEC_CONF_DIR" "$VPSSEC_STATE_DIR"
     rm -rf "$INSTALL_DIR"
+    rm -rf "$TARGET_DIR"
     rm -f /usr/local/bin/vpssec
-    ok "vps-security removed. Firewall rules and SSH config were left untouched."
+    ok "vps-security fully removed: services, config, state, CLI and repo copy."
+    ok "SSH is on port 22 and the firewall is disabled — server is wide open."
 }
 
 cmd_help() {

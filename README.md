@@ -8,7 +8,7 @@
 
 1. **System update** — runs `apt update && apt upgrade -y`
 2. **SSH port change** — moves SSH off port 22 to a port you choose (with automatic rollback if sshd fails to come back)
-3. **Firewall (ufw)** — installs ufw, opens **only** the ports you approve, and enables it
+3. **Firewall (ufw)** — installs ufw, opens **only** the ports you approve and enables it. If you specify **no ports at all**, the firewall is left **disabled** and the server stays open on every port
 4. **Rogue-port monitor** — every 30 minutes scans live connections; any port **not** in your allow-list that is actively transferring data gets **blocked via ufw for 1 hour**, then automatically released
 5. **Bot & Scanner Shield** — per-IP connection rate limits, TCP-flag scan drops (NULL / SYN+FIN / SYN+RST / ALL), and auto-ban of SYN-flooding IPs for one hour
 6. **GeoIP country filter** — allow **any number of countries** you choose (e.g. only Iran and Germany) and block every other country from reaching the server
@@ -64,7 +64,7 @@ Navigate with **↑/↓** (or `j`/`k`), select with **Enter**, go back with **q*
 | `sudo vpssec shield status` | Bot & Scanner Shield state + banned IPs |
 | `sudo vpssec geo list` | GeoIP filter configuration |
 | `sudo vpssec logs [n]` | Show monitor log |
-| `sudo vpssec uninstall` | Remove vps-security (ufw rules are kept) |
+| `sudo vpssec uninstall` | **Full cleanup:** removes everything, restores SSH to port 22, resets & disables ufw (keeping SSH reachable) |
 
 ## How the rogue-port monitor works
 
@@ -137,7 +137,7 @@ It stays local-only by default — do not expose it publicly without an authenti
 - The SSH-port change **backs up** `sshd_config`, validates with `sshd -t`, and **rolls back automatically** if sshd does not come up on the new port.
 - The old SSH port stays open until you confirm the new one works, and is only closed after you approve.
 - ufw is enabled **after** your approved ports (including SSH) are allowed, so you can never lock yourself out.
-- `vpssec uninstall` removes the tool but **never** touches your existing ufw rules or SSH config.
+- `vpssec uninstall` performs a **full factory reset**: stops and removes all services, deletes every vps-security config/state file, restores the SSH port to **22**, and runs `ufw reset` → `ufw allow 22` → `ufw disable`, so the server ends up exactly as it started — open, with SSH on port 22.
 
 ## Requirements
 
