@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 # ============================================================
-# vpssec — interactive security CLI for Ubuntu servers
+# vpssec — beautiful interactive security CLI for Ubuntu servers
 #
-# Usage: sudo vpssec            (menu)
+# Usage: sudo vpssec            (TUI menu)
 #        sudo vpssec <command>  (direct)
 #
 # Commands:
 #   install      First-time setup (update, SSH port, firewall, monitor)
 #   status       Show firewall, SSH and monitor status
-#   ports        View / add / remove allowed ports
+#   ports        Add / remove allowed ports
 #   port         Change the SSH port
-#   monitor      View monitor status and recent events
-#   unblock      Remove a port from the block list
+#   scan         Run a rogue-port scan right now
+#   blocked      View blocked ports
+#   unblock      Release a blocked port
+#   update       Update vps-security from GitHub
 #   logs         Show monitor log
 #   uninstall    Remove vps-security completely
 #   help         Show this help
+#
+# The TUI needs arrow keys; over a plain pipe it falls back to a
+# numbered menu automatically.
 # ============================================================
 
 set -u
@@ -23,19 +28,117 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
+REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
+REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"
 
 # Sandbox-overridable system paths (test suite redirects these)
 SSH_CFG="${VPSSEC_SSHD_CONFIG:-/etc/ssh/sshd_config}"
 SYSTEMCTL="${VPSSEC_SYSTEMCTL:-systemctl}"
+TARGET_DIR="${VPSSEC_TARGET_DIR:-/opt/vps-security}"
 
 svc_restart_ssh() {
     $SYSTEMCTL restart sshd 2>/dev/null || $SYSTEMCTL restart ssh 2>/dev/null || service ssh restart
 }
 
 # ============================================================
-# Helpers
+# Tiny TUI helpers (pure bash + ANSI)
+# ============================================================
+
+ui_header() {
+    echo -e "${CYAN}${BOLD}"
+    cat <<'BANNER'
+    __    __    ____    ____  ____   ______  .______        _______.
+   /  \  /  \  / __ \  \   \/   /  /      | |   _  \      /       |
+  /  ^  ^  \ / / _\ \  \  \  /   |  ,----' |  |_)  |    |   (----`
+ /  /_\\  \ (  (_)  )  |  |  |   |  |      |      /      \   \    
+/  _____,  \ \____/   _|  |__|  _|  |____ _|  |\  \----.)   |    
+\_/     \__/          |__| (_____|________)_| _| `._____|____/     
+BANNER
+    echo -e "${RESET}"
+    echo -e "  ${BOLD}vps-security${RESET} ${DIM}v${VERSION}${RESET} ${DIM}— server hardening toolkit${RESET}"
+    echo
+}
+
+ui_line() { echo -e "  ${DIM}─────────────────────────────────────────────────────${RESET}"; }
+
+ui_title() {
+    clear 2>/dev/null || true
+    ui_header
+    echo -e "  ${BOLD}${CYAN}$1${RESET}"
+    ui_line
+    echo
+}
+
+# Draw a menu: ui_menu "Title" item1 item2 ... ; returns chosen index in MENU_IDX
+# Arrow keys + Enter, or number keys + Enter. Q = quit (idx 0).
+ui_menu() {
+    local title="$1"; shift
+    local items=("$@")
+    local sel=0 n=${#items[@]}
+
+    # No TTY -> simple numbered fallback
+    if [ ! -t 0 ]; then
+        ui_title "$title"
+        local i
+        for i in "${!items[@]}"; do
+            printf "  %2d) %s\n" $((i + 1)) "${items[$i]}"
+        done
+        printf "   0) Back / Exit\n"
+        prompt "Select: "
+        read -r MENU_IDX
+        case "$MENU_IDX" in
+            ''|*[!0-9]*) MENU_IDX=0 ;;
+        esac
+        [ "$MENU_IDX" -gt "$n" ] && MENU_IDX=0
+        return 0
+    fi
+
+    # Arrow-key mode
+    ui_title "$title"
+    while :; do
+        local i row=$((2))
+        printf "\033[H" 2>/dev/null || true
+        for i in "${!items[@]}"; do
+            local marker="${DIM} ${RESET}" color="" line
+            line="${items[$i]}"
+            if [ "$i" -eq "$sel" ]; then
+                printf "  ${GREEN}❯ ${BOLD}%s${RESET}\n" "$line"
+            else
+                printf "    ${DIM}%s${RESET}\n" "$line"
+            fi
+        done
+        printf "\n  ${DIM}↑/↓ move · Enter select · q back${RESET}\n"
+        printf "\033[%dA" "$((n + 2))" 2>/dev/null || true
+        IFS= read -rsn1 key
+        case "$key" in
+            $'\x1b')   # escape sequence
+                read -rsn2 -t 0.1 rest
+                case "$rest" in
+                    '[A'|'OA') ((sel > 0)) && sel=$((sel - 1)) ;;
+                    '[B'|'OB') ((sel < n - 1)) && sel=$((sel + 1)) ;;
+                esac
+                ;;
+            'k') ((sel > 0)) && sel=$((sel - 1)) ;;
+            'j') ((sel < n - 1)) && sel=$((sel + 1)) ;;
+            '') [ "$n" -gt 0 ] && { MENU_IDX=$((sel + 1)); return 0; } ;;
+            'q') MENU_IDX=0; return 0 ;;
+            [1-9])
+                if [ "$key" -le "$n" ]; then MENU_IDX="$key"; return 0; fi
+                ;;
+        esac
+    done
+}
+
+ui_press_any_key() {
+    echo
+    prompt "Press Enter to continue..."
+    read -r _
+}
+
+# ============================================================
+# Shared helpers
 # ============================================================
 
 prompt() { printf "%b" "${BOLD}$*${RESET}" >&2; }
@@ -69,12 +172,6 @@ read_confirm() {
     esac
 }
 
-pause_menu() {
-    echo
-    prompt "Press Enter to return to the menu..."
-    read -r _
-}
-
 ssh_port_in_config() {
     grep -E '^\s*Port\s+' "$SSH_CFG" 2>/dev/null | tail -1 | awk '{print $2}'
 }
@@ -88,8 +185,31 @@ set_ssh_port() {
     fi
 }
 
+port_count() { list_ports_raw | wc -l | tr -d ' '; }
+
+list_ports_raw() {
+    [ -f "$ALLOWED_PORTS_CONF" ] || return 0
+    while IFS= read -r p || [ -n "$p" ]; do
+        p="${p%%#*}"; p="$(printf '%s' "$p" | tr -d '[:space:]')"
+        [ -z "$p" ] && continue
+        printf '%s\n' "$p"
+    done < "$ALLOWED_PORTS_CONF"
+}
+
+blocked_count() {
+    [ -f "$BLOCK_LIST_FILE" ] && grep -cE '^[0-9]+\|[0-9]+$' "$BLOCK_LIST_FILE" || true
+}
+
+ufw_active() {
+    command -v ufw >/dev/null 2>&1 && [ "$(ufw status 2>/dev/null | head -1 | awk '{print $2}')" = "active" ]
+}
+
+monitor_installed() {
+    [ -f "$VPSSEC_SYSTEMD_DIR/vps-security-monitor.timer" ]
+}
+
 # ============================================================
-# Command implementations
+# Install flow (step 1-4 guided setup)
 # ============================================================
 
 cmd_install() {
@@ -154,7 +274,7 @@ cmd_install() {
                     ufw delete allow "$current_port"/tcp >/dev/null 2>&1 || true
                     ok "Old port $current_port closed."
                 else
-                    info "Old port left open — close it later with: sudo vpssec ports"
+                    info "Old port left open — close it later from Ports menu."
                 fi
                 current_port="$new_port"
             else
@@ -195,7 +315,7 @@ cmd_install() {
             warn "Invalid port."
             continue
         fi
-        if grep -qx "$p" "$ALLOWED_PORTS_CONF"; then
+        if grep -qx "$p" "$ALLOWED_PORTS_CONF" 2>/dev/null; then
             info "  $p is already in the list."
             continue
         fi
@@ -237,7 +357,7 @@ EOF
         ufw allow "$guard_port"/udp >/dev/null
         ok "Monitor API port $guard_port open."
     else
-        info "Monitor API stays local-only. Add it later with: sudo vpssec ports"
+        info "Monitor API stays local-only. Add it later from the Ports menu."
     fi
     if read_confirm "Run a first monitor scan now? [Y/n] "; then
         "$SCRIPT_DIR/lib/monitor.sh" --scan || true
@@ -256,7 +376,6 @@ EOF
     echo
     info "CLI       : sudo vpssec"
     info "Status    : sudo vpssec status"
-    info "Monitor   : sudo vpssec monitor"
     echo
 }
 
@@ -309,88 +428,241 @@ EOF
     ok "Monitor timer armed (every 30 min) and guard service started."
 }
 
+# ============================================================
+# Status dashboard
+# ============================================================
+
 cmd_status() {
     need_root
-    echo
-    echo "================= vps-security status ================="
-    echo
-    echo "--- Firewall (ufw) ---"
-    if command -v ufw >/dev/null 2>&1; then
-        ufw status verbose
+    ensure_dirs
+    ui_title "Dashboard — System Security Status"
+    local allowed_n blocked_n
+    allowed_n="$(port_count)"
+    blocked_n="$(blocked_count)"
+
+    # Firewall
+    if ufw_active; then
+        printf "  ${GREEN}●${RESET} Firewall        : active (ufw)\n"
+    elif command -v ufw >/dev/null 2>&1; then
+        printf "  ${YELLOW}●${RESET} Firewall        : installed but inactive\n"
     else
-        warn "ufw is not installed."
+        printf "  ${RED}●${RESET} Firewall        : ufw not installed\n"
     fi
+
+    # SSH
+    local sp
+    sp="$(ssh_port_in_config)"
+    [ -z "$sp" ] && sp="22"
+    printf "  ${CYAN}●${RESET} SSH port        : %s\n" "$sp"
+
+    # Monitor
+    if monitor_installed; then
+        printf "  ${GREEN}●${RESET} Rogue monitor   : installed (every 30 min)\n"
+    else
+        printf "  ${YELLOW}●${RESET} Rogue monitor   : not installed\n"
+    fi
+
+    # Summary
+    printf "  ${CYAN}●${RESET} Allowed ports   : %s\n" "$allowed_n"
+    if [ "$blocked_n" -gt 0 ]; then
+        printf "  ${RED}●${RESET} Blocked ports   : %s\n" "$blocked_n"
+    else
+        printf "  ${GREEN}●${RESET} Blocked ports   : 0\n"
+    fi
+
     echo
-    echo "--- SSH ---"
-    echo "Configured SSH port : $(ssh_port_in_config || echo '22 (default)')"
-    ss -tlnp 2>/dev/null | grep -i ssh || true
+    ui_line
     echo
-    "$SCRIPT_DIR/lib/monitor.sh" --status || true
+    if command -v ufw >/dev/null 2>&1; then
+        ufw status verbose | sed 's/^/  /'
+        echo
+    fi
+    "$SCRIPT_DIR/lib/monitor.sh" --status | tail -n +2 | sed 's/^/  /' || true
     echo
-    echo "--- Services ---"
+    echo "  Services:"
     $SYSTEMCTL is-active vps-security-monitor.timer >/dev/null 2>&1 \
-        && ok "monitor timer: active" || warn "monitor timer: not installed/inactive"
+        && printf "    ${GREEN}●${RESET} monitor timer : active\n" \
+        || printf "    ${DIM}○${RESET} monitor timer : not active\n"
     $SYSTEMCTL is-active vps-security-guard.service >/dev/null 2>&1 \
-        && ok "guard service: active" || warn "guard service: not installed/inactive"
+        && printf "    ${GREEN}●${RESET} guard service : active\n" \
+        || printf "    ${DIM}○${RESET} guard service : not active\n"
     echo
 }
 
-cmd_ports() {
-    need_root
+# ============================================================
+# Ports — add / remove (with list)
+# ============================================================
+
+action_port_add() {
     ensure_dirs
     touch "$ALLOWED_PORTS_CONF"
+    local p
+    p="$(read_port "Port to open (e.g. 443)" "")"
+    if grep -qx "$p" "$ALLOWED_PORTS_CONF" 2>/dev/null; then
+        info "Port $p is already in the allowed list."
+        return 0
+    fi
+    echo "$p" >> "$ALLOWED_PORTS_CONF"
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow "$p"/tcp >/dev/null 2>&1
+        ufw allow "$p"/udp >/dev/null 2>&1
+    fi
+    ok "Port $p is now open (allowed + ufw rule)."
+}
+
+action_port_remove() {
+    ensure_dirs
+    if [ "$(port_count)" -eq 0 ]; then
+        warn "The allowed list is empty — nothing to remove."
+        return 0
+    fi
+    ui_title "Allowed Ports — Remove One"
+    local ports=() i n=0
+    while IFS= read -r p; do ports+=("$p"); done < <(list_ports_raw)
+    for i in "${!ports[@]}"; do
+        printf "  %2d) port %s\n" $((i + 1)) "${ports[$i]}"
+    done
+    echo
+    prompt "Number of the port to REMOVE (empty = cancel): "
+    read -r idx
+    [ -z "$idx" ] && { info "Cancelled."; return 0; }
+    case "$idx" in
+        ''|*[!0-9]*) warn "Invalid choice."; return 0 ;;
+    esac
+    [ "$idx" -lt 1 ] || [ "$idx" -gt "${#ports[@]}" ] && { warn "Invalid choice."; return 0; }
+    local target="${ports[$((idx - 1))]}"
+
+    local sp
+    sp="$(ssh_port_in_config || echo 22)"
+    if [ "$target" = "$sp" ]; then
+        err "Port $target is the SSH port — refusing to remove it (you would lock yourself out)."
+        return 0
+    fi
+
+    sed -i "/^${target}\$/d" "$ALLOWED_PORTS_CONF"
+    if command -v ufw >/dev/null 2>&1; then
+        ufw delete allow "$target"/tcp >/dev/null 2>&1
+        ufw delete allow "$target"/udp >/dev/null 2>&1
+    fi
+    ok "Port $target removed from the allowed list and closed in ufw."
+}
+
+action_ports_menu() {
     while :; do
-        echo
-        echo "=========== Allowed ports ==========="
-        list_ports
-        echo
-        echo " 1) Add port    2) Remove port    0) Back"
-        prompt "Choice: "
-        read -r c
+        ui_menu "Ports — Manage Allowed Ports" \
+            "➕ Add an allowed port (open)" \
+            "➖ Remove an allowed port (close)" \
+            "📋 Show allowed ports list"
+        local c="$MENU_IDX"
         case "$c" in
-            1)
-                local p
-                p="$(read_port "Port to add" "")"
-                if grep -qx "$p" "$ALLOWED_PORTS_CONF"; then
-                    info "Already in the list."
-                else
-                    echo "$p" >> "$ALLOWED_PORTS_CONF"
-                    ufw allow "$p"/tcp >/dev/null 2>&1
-                    ufw allow "$p"/udp >/dev/null 2>&1
-                    ok "Port $p added and opened in ufw."
-                fi
-                ;;
-            2)
-                local p
-                p="$(read_port "Port to remove" "")"
-                if grep -qx "$p" "$ALLOWED_PORTS_CONF"; then
-                    sed -i "/^${p}\$/d" "$ALLOWED_PORTS_CONF"
-                    ufw delete allow "$p"/tcp >/dev/null 2>&1
-                    ufw delete allow "$p"/udp >/dev/null 2>&1
-                    ok "Port $p removed and closed in ufw."
-                else
-                    warn "Port $p is not in the list."
-                fi
-                ;;
+            1) action_port_add; ui_press_any_key ;;
+            2) action_port_remove; ui_press_any_key ;;
+            3) ui_title "Allowed Ports"
+               if [ "$(port_count)" -eq 0 ]; then
+                   warn "The allowed list is empty."
+               else
+                   local n=0 p
+                   while IFS= read -r p; do
+                       n=$((n + 1)); printf "  %2d) %s\n" "$n" "$p"
+                   done < <(list_ports_raw)
+               fi
+               ui_press_any_key ;;
             0) return 0 ;;
-            *) warn "Unknown choice." ;;
         esac
     done
 }
 
-list_ports() {
-    local n=0 p
-    while IFS= read -r p || [ -n "$p" ]; do
-        p="${p%%#*}"; p="$(printf '%s' "$p" | tr -d '[:space:]')"
-        [ -z "$p" ] && continue
-        n=$((n + 1))
-        printf '  %2d) %s\n' "$n" "$p"
-    done < "$ALLOWED_PORTS_CONF"
-    [ "$n" -eq 0 ] && echo "  (empty)"
+cmd_ports() {
+    need_root
+    action_ports_menu
 }
+
+# ============================================================
+# Blocked ports + unblock
+# ============================================================
+
+action_blocked_view() {
+    ensure_dirs
+    ui_title "Blocked Ports"
+    local n=0
+    if [ -f "$BLOCK_LIST_FILE" ] && [ -s "$BLOCK_LIST_FILE" ]; then
+        local now ts port remain
+        now="$(date +%s)"
+        while IFS='|' read -r ts port || [ -n "${ts:-}" ]; do
+            [ -z "${ts:-}" ] && continue
+            is_valid_port "$port" || continue
+            n=$((n + 1))
+            remain=$(( 3600 - (now - ts) ))
+            [ "$remain" -lt 0 ] && remain=0
+            printf "  %2d) port %-6s ${YELLOW}unblocks in %dm %02ds${RESET}\n" "$n" "$port" $((remain / 60)) $((remain % 60))
+        done < "$BLOCK_LIST_FILE"
+    fi
+    [ "$n" -eq 0 ] && info "No ports are currently blocked. All clear ✓"
+    return 0
+}
+
+action_unblock() {
+    ensure_dirs
+    ui_title "Unblock a Port"
+    local ports=() ts port n=0
+    if [ -f "$BLOCK_LIST_FILE" ] && [ -s "$BLOCK_LIST_FILE" ]; then
+        while IFS='|' read -r ts port || [ -n "${ts:-}" ]; do
+            [ -z "${ts:-}" ] && continue
+            is_valid_port "$port" || continue
+            ports+=("$port")
+            n=$((n + 1))
+            printf "  %2d) port %s\n" "$n" "$port"
+        done < "$BLOCK_LIST_FILE"
+    fi
+    if [ "$n" -eq 0 ]; then
+        info "No ports are currently blocked."
+        return 0
+    fi
+    echo
+    prompt "Number of the port to UNBLOCK (empty = cancel): "
+    read -r idx
+    [ -z "$idx" ] && { info "Cancelled."; return 0; }
+    case "$idx" in
+        ''|*[!0-9]*) warn "Invalid choice."; return 0 ;;
+    esac
+    [ "$idx" -lt 1 ] || [ "$idx" -gt "$n" ] && { warn "Invalid choice."; return 0; }
+    local target="${ports[$((idx - 1))]}"
+    "$SCRIPT_DIR/lib/monitor.sh" --unblock "$target"
+}
+
+cmd_blocked() {
+    need_root
+    action_blocked_view
+}
+
+cmd_unblock() {
+    need_root
+    local p="${1:-}"
+    if [ -z "$p" ]; then
+        action_unblock
+    else
+        "$SCRIPT_DIR/lib/monitor.sh" --unblock "$p"
+    fi
+}
+
+# ============================================================
+# Scan now
+# ============================================================
+
+action_scan() {
+    ui_title "Run Rogue-Port Scan Now"
+    info "Scanning live connections..."
+    "$SCRIPT_DIR/lib/monitor.sh" --scan || true
+    ok "Scan finished. Check Blocked Ports for the results."
+}
+
+# ============================================================
+# SSH port change
+# ============================================================
 
 cmd_port() {
     need_root
+    ui_title "Change SSH Port"
     local cur new
     cur="$(ssh_port_in_config)"
     [ -z "$cur" ] && cur="22"
@@ -402,36 +674,72 @@ cmd_port() {
     set_ssh_port "$new"
     if sshd -t 2>/dev/null; then
         svc_restart_ssh
-        ok "SSH port changed to $new (old port $cur left open — remove it with 'vpssec ports')."
+        ok "SSH port changed to $new (old port $cur left open — remove it from Ports)."
     else
         cp "$(ls -t "$SSH_CFG".bak.* 2>/dev/null | head -1)" "$SSH_CFG"
         die "Port change failed — config restored."
     fi
 }
 
-cmd_monitor() {
-    "$SCRIPT_DIR/lib/monitor.sh" --status
+# ============================================================
+# Update
+# ============================================================
+
+cmd_update() {
+    need_root
+    ui_title "Update vps-security"
+    info "Fetching the latest version from GitHub..."
+    if [ ! -d "$TARGET_DIR/.git" ]; then
+        err "vps-security is not installed at $TARGET_DIR."
+        info "Install it first:  bash <(curl -fsSL $REPO_RAW/install.sh)"
+        return 1
+    fi
+    local before
+    before="$(git -C "$TARGET_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    if ! git -C "$TARGET_DIR" fetch origin main 2>&1 | sed 's/^/    /'; then
+        err "Could not reach GitHub (check the server's internet access)."
+        return 1
+    fi
+    local after
+    after="$(git -C "$TARGET_DIR" rev-parse --short origin/main 2>/dev/null || echo unknown)"
+    if [ "$before" = "$after" ]; then
+        ok "Already up to date ($before)."
+        return 0
+    fi
+    git -C "$TARGET_DIR" reset --hard origin/main >/dev/null 2>&1
+    chmod +x "$TARGET_DIR/vpssec" "$TARGET_DIR"/lib/*.sh "$TARGET_DIR"/test/*.sh 2>/dev/null || true
+    ln -sf "$TARGET_DIR/vpssec" /usr/local/bin/vpssec
+    ok "Updated: $before → $after."
+    if [ -x "$TARGET_DIR/lib/monitor.sh" ]; then
+        $SYSTEMCTL restart vps-security-guard.service 2>/dev/null || true
+        $SYSTEMCTL restart vps-security-monitor.timer 2>/dev/null || true
+        ok "Services restarted with the new code."
+    fi
 }
 
-cmd_unblock() {
-    need_root
-    local p="${1:-}"
-    if [ -z "$p" ]; then
-        p="$(read_port "Port to unblock now" "")"
-    fi
-    "$SCRIPT_DIR/lib/monitor.sh" --unblock "$p"
-}
+# ============================================================
+# Logs
+# ============================================================
 
 cmd_logs() {
     ensure_dirs
     local f="$VPSSEC_STATE_DIR/monitor.log"
+    ui_title "Monitor Log (last 30 lines)"
     [ -f "$f" ] || { info "No monitor log yet."; return 0; }
-    tail -n "${2:-50}" "$f"
+    tail -n 30 "$f" | sed 's/^/  /'
 }
+
+# ============================================================
+# Uninstall
+# ============================================================
 
 cmd_uninstall() {
     need_root
-    if ! read_confirm "Remove vps-security completely (monitor, guard, CLI; ufw rules stay)? [y/N] " "n"; then
+    ui_title "Uninstall vps-security"
+    warn "This removes the monitor, guard service, CLI and repository copy."
+    info "Your firewall rules and SSH config are NOT touched."
+    echo
+    if ! read_confirm "Type Y to confirm uninstall [y/N] " "n"; then
         info "Aborted."
         return 0
     fi
@@ -446,44 +754,40 @@ cmd_uninstall() {
 }
 
 cmd_help() {
-    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # ============================================================
-# Menu
+# Main TUI menu
 # ============================================================
 
 show_menu() {
     while :; do
-        echo
-        echo "=============================================="
-        echo "   vps-security $VERSION"
-        echo "=============================================="
-        echo " 1) Guided install (update/SSH/firewall/monitor)"
-        echo " 2) Status"
-        echo " 3) Manage allowed ports"
-        echo " 4) Change SSH port"
-        echo " 5) Monitor status and events"
-        echo " 6) Unblock a port now"
-        echo " 7) Logs"
-        echo " 8) Uninstall"
-        echo " 0) Exit"
-        echo "=============================================="
-        prompt "Select: "
-        read -r choice
-        case "$choice" in
-            1) cmd_install ;;
-            2) cmd_status ;;
-            3) cmd_ports ;;
-            4) cmd_port ;;
-            5) cmd_monitor ;;
-            6) cmd_unblock ;;
-            7) cmd_logs ;;
-            8) cmd_uninstall ;;
-            0) exit 0 ;;
-            *) warn "Unknown option." ;;
+        ui_menu "Main Menu" \
+            "🚀 Guided install (update · SSH port · firewall · monitor)" \
+            "📊 Dashboard — system security status" \
+            "🔌 Ports — add / remove allowed ports" \
+            "🔑 Change SSH port" \
+            "🔍 Scan for rogue ports now" \
+            "⛔ View blocked ports" \
+            "🔓 Unblock a port" \
+            "📜 Monitor logs" \
+            "⬆️  Update vps-security" \
+            "🗑️  Uninstall vps-security" \
+            "🚪 Exit"
+        case "$MENU_IDX" in
+            1) cmd_install; ui_press_any_key ;;
+            2) cmd_status; ui_press_any_key ;;
+            3) action_ports_menu ;;
+            4) cmd_port; ui_press_any_key ;;
+            5) action_scan; ui_press_any_key ;;
+            6) action_blocked_view; ui_press_any_key ;;
+            7) action_unblock; ui_press_any_key ;;
+            8) cmd_logs; ui_press_any_key ;;
+            9) cmd_update; ui_press_any_key ;;
+            10) cmd_uninstall; ui_press_any_key ;;
+            0|11) exit 0 ;;
         esac
-        pause_menu
     done
 }
 
@@ -497,10 +801,13 @@ case "${1:-}" in
     status)    cmd_status ;;
     ports)     cmd_ports ;;
     port)      cmd_port ;;
-    monitor)   cmd_monitor ;;
+    scan)      need_root; action_scan ;;
+    blocked)   cmd_blocked ;;
     unblock)   shift; cmd_unblock "$@" ;;
+    update)    cmd_update ;;
     logs)      shift; cmd_logs "$@" ;;
     uninstall) cmd_uninstall ;;
     help|-h|--help) cmd_help ;;
+    version|--version) echo "vpssec $VERSION" ;;
     *) die "Unknown command: $1 (try 'vpssec help')" ;;
 esac

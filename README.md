@@ -1,8 +1,8 @@
 # vps-security 🛡️
 
-**Server security hardening for Ubuntu/Debian VPS — one interactive CLI.**
+**Server security hardening for Ubuntu/Debian VPS — one beautiful interactive CLI.**
 
-`vpssec` walks you through the essential first steps of securing a fresh server:
+`vpssec` is a full TUI (arrow keys + emoji menu) that walks you through the essential first steps of securing a fresh server:
 
 1. **System update** — runs `apt update && apt upgrade -y`
 2. **SSH port change** — moves SSH off port 22 to a port you choose (with automatic rollback if sshd fails to come back)
@@ -19,38 +19,42 @@ bash <(curl -fsSL https://raw.githubusercontent.com/amir12120/vps-security/main/
 
 The installer clones this repo to `/opt/vps-security`, installs the `vpssec` command, and starts the guided setup.
 
-## Interactive CLI
+## Interactive TUI
 
 ```bash
 sudo vpssec
 ```
 
 ```
-==============================================
-   vps-security 1.0.0
-==============================================
- 1) Guided install (update/SSH/firewall/monitor)
- 2) Status
- 3) Manage allowed ports
- 4) Change SSH port
- 5) Monitor status and events
- 6) Unblock a port now
- 7) Logs
- 8) Uninstall
- 0) Exit
-==============================================
+  vps-security v1.1.0 — server hardening toolkit
+
+  Main Menu
+  ─────────────────────────────────────────────
+  ❯ 🚀 Guided install (update · SSH port · firewall · monitor)
+    📊 Dashboard — system security status
+    🔌 Ports — add / remove allowed ports
+    🔑 Change SSH port
+    🔍 Scan for rogue ports now
+    ⛔ View blocked ports
+    🔓 Unblock a port
+    📜 Monitor logs
+    ⬆️  Update vps-security
+    🗑️  Uninstall vps-security
+    🚪 Exit
 ```
 
-Direct commands:
+Navigate with **↑/↓** (or `j`/`k`), select with **Enter**, go back with **q**. Over a plain pipe (CI, scripts) it automatically falls back to a numbered menu — everything is also available as direct commands:
 
 | Command | Description |
 |---|---|
 | `sudo vpssec install` | Full guided setup (the 4 steps above) |
-| `sudo vpssec status` | Firewall, SSH and monitor status |
-| `sudo vpssec ports` | View / add / remove allowed ports |
+| `sudo vpssec status` | Dashboard: firewall, SSH, monitor, counts |
+| `sudo vpssec ports` | Add / remove / list allowed ports |
 | `sudo vpssec port` | Change the SSH port |
-| `sudo vpssec monitor` | Monitor status + recent block events |
-| `sudo vpssec unblock <port>` | Release a blocked port immediately |
+| `sudo vpssec scan` | Run a rogue-port scan right now |
+| `sudo vpssec blocked` | View blocked ports + time until auto-release |
+| `sudo vpssec unblock [port]` | Release a blocked port immediately |
+| `sudo vpssec update` | Update vps-security from GitHub (`git pull` in place) |
 | `sudo vpssec logs [n]` | Show monitor log |
 | `sudo vpssec uninstall` | Remove vps-security (ufw rules are kept) |
 
@@ -60,6 +64,8 @@ Direct commands:
 - The scanner reads live connections from `ss -tunap` and collects the **local ports with active traffic** (established TCP, connected UDP).
 - Any such port **not** in `/etc/vps-security/allowed-ports.list` is added to ufw as `deny <port>/{tcp,udp}` for **3600 seconds**.
 - After the hour expires, the next scan removes the rule and logs `UNBLOCK`.
+- View currently blocked ports (with a live countdown) via the **⛔ View blocked ports** menu or `vpssec blocked`.
+- Release a port early via **🔓 Unblock a port** or `vpssec unblock <port>`.
 - The SSH port itself and the monitor's own ports are **never** blocked — even if they are not in the allow-list.
 - All actions are logged to `/var/lib/vps-security/port-blocks.log` and `/var/lib/vps-security/monitor.log`.
 
