@@ -459,6 +459,29 @@ Unit=vps-security-monitor.service
 WantedBy=timers.target
 EOF
 
+    cat > "$VPSSEC_SYSTEMD_DIR/vps-security-maint.service" <<EOF
+[Unit]
+Description=vps-security maintenance (RAM cache + log cleanup)
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/lib/maintain.sh --run
+EOF
+
+    cat > "$VPSSEC_SYSTEMD_DIR/vps-security-maint.timer" <<EOF
+[Unit]
+Description=Run vps-security maintenance every 2 days
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=2d
+Persistent=true
+Unit=vps-security-maint.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
     cat > "$VPSSEC_SYSTEMD_DIR/vps-security-guard.service" <<EOF
 [Unit]
 Description=vps-security local guard API
@@ -473,8 +496,9 @@ EOF
 
     $SYSTEMCTL daemon-reload
     $SYSTEMCTL enable --now vps-security-monitor.timer
+    $SYSTEMCTL enable --now vps-security-maint.timer
     $SYSTEMCTL restart vps-security-guard.service
-    ok "Monitor timer armed (every 30 min) and guard service started."
+    ok "Monitor timer armed (every 30 min), maintenance timer armed (every 2 days), guard service started."
 }
 
 # ============================================================
@@ -509,6 +533,13 @@ cmd_status() {
         printf "  ${GREEN}●${RESET} Rogue monitor   : installed (every 30 min)\n"
     else
         printf "  ${YELLOW}●${RESET} Rogue monitor   : not installed\n"
+    fi
+
+    # Maintenance
+    if [ -f "$VPSSEC_SYSTEMD_DIR/vps-security-maint.timer" ]; then
+        printf "  ${GREEN}●${RESET} Maintenance     : installed (RAM cache + log cleanup, every 2 days)\n"
+    else
+        printf "  ${YELLOW}●${RESET} Maintenance     : not installed\n"
     fi
 
     # Summary
@@ -853,6 +884,7 @@ cmd_uninstall() {
 
     # 1. stop & remove everything vps-security installed
     $SYSTEMCTL disable --now vps-security-monitor.timer 2>/dev/null || true
+    $SYSTEMCTL disable --now vps-security-maint.timer 2>/dev/null || true
     $SYSTEMCTL disable --now vps-security-shield.timer 2>/dev/null || true
     $SYSTEMCTL disable --now vps-security-geo.timer 2>/dev/null || true
     $SYSTEMCTL stop vps-security-guard.service 2>/dev/null || true
@@ -883,6 +915,7 @@ cmd_uninstall() {
 
     # 4. remove units and ALL config/state
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-monitor.{service,timer}
+    rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-maint.{service,timer}
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-guard.service
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-shield.{service,timer}
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-geo.{service,timer}
@@ -915,6 +948,7 @@ show_menu() {
             "🔓 Unblock a port" \
             "📜 Monitor logs" \
             "⬆️  Update vps-security" \
+            "🧹 Maintenance — RAM cache & log cleanup" \
             "🛡️  Bot & Scanner Shield" \
             "🌍 GeoIP country filter" \
             "🗑️  Uninstall vps-security" \
@@ -929,12 +963,42 @@ show_menu() {
             7) action_unblock; ui_press_any_key ;;
             8) cmd_logs; ui_press_any_key ;;
             9) cmd_update; ui_press_any_key ;;
-            10) action_shield_menu ;;
-            11) action_geo_menu ;;
-            12) cmd_uninstall; ui_press_any_key ;;
-            0|13) exit 0 ;;
+            10) action_maint_menu; ui_press_any_key ;;
+            11) action_shield_menu ;;
+            12) action_geo_menu ;;
+            13) cmd_uninstall; ui_press_any_key ;;
+            0|14) exit 0 ;;
         esac
     done
+}
+
+# ============================================================
+# Maintenance — RAM cache & log cleanup (every 2 days)
+# ============================================================
+
+action_maint_menu() {
+    ui_title "Maintenance — RAM cache & log cleanup"
+    bash "$SCRIPT_DIR/lib/maintain.sh" --status
+    echo
+    info "1) Run maintenance now"
+    info "2) Go back"
+    prompt "Choice: "
+    read -r c
+    case "$c" in
+        1)
+            need_root
+            info "Clearing RAM cache and cleaning logs..."
+            MAINT_CLEAR_SWAP="${MAINT_CLEAR_SWAP:-0}" bash "$SCRIPT_DIR/lib/maintain.sh" --run
+            ;;
+    esac
+}
+
+cmd_maint() {
+    case "${1:-status}" in
+        run)    need_root; MAINT_CLEAR_SWAP="${MAINT_CLEAR_SWAP:-0}" bash "$SCRIPT_DIR/lib/maintain.sh" --run ;;
+        status) bash "$SCRIPT_DIR/lib/maintain.sh" --status ;;
+        *)      bash "$SCRIPT_DIR/lib/maintain.sh" --status ;;
+    esac
 }
 
 # ============================================================
@@ -1076,6 +1140,7 @@ case "${1:-}" in
     uninstall) cmd_uninstall ;;
     shield)    shift; cmd_shield "$@" ;;
     geo)       shift; cmd_geo "$@" ;;
+    maint)     shift; cmd_maint "$@" ;;
     help|-h|--help) cmd_help ;;
     version|--version) echo "vpssec $VERSION" ;;
     *) die "Unknown command: $1 (try 'vpssec help')" ;;

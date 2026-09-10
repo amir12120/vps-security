@@ -162,6 +162,8 @@ check "allowed-ports list written"      "grep -q '^2222$' '$VPSSEC_CONF_DIR/allo
 check "monitor conf written"            "grep -q 'MONITOR_SELF_PORT=2222' '$VPSSEC_CONF_DIR/monitor.conf' && grep -q 'MONITOR_GUARD_PORT=18080' '$VPSSEC_CONF_DIR/monitor.conf'"
 check "monitor timer unit installed"    "grep -q 'monitor.sh --scan' '$VPSSEC_SYSTEMD_DIR/vps-security-monitor.service' && grep -q 'OnUnitActiveSec=30min' '$VPSSEC_SYSTEMD_DIR/vps-security-monitor.timer'"
 check "timer enabled via systemctl"     "grep -q 'enable --now vps-security-monitor.timer' '$SANDBOX/systemctl.log'"
+check "maint timer unit installed"      "grep -q 'OnUnitActiveSec=2d' '$VPSSEC_SYSTEMD_DIR/vps-security-maint.timer' && grep -q 'maintain.sh --run' '$VPSSEC_SYSTEMD_DIR/vps-security-maint.service'"
+check "maint timer enabled via systemctl" "grep -q 'enable --now vps-security-maint.timer' '$SANDBOX/systemctl.log'"
 
 echo
 echo "=== smoke: standalone SSH port change opens ufw + allow-list BEFORE switching ==="
@@ -448,9 +450,11 @@ check "boot restore keeps safe geo rules"    "grep -q 'vps-security geoip BEGIN'
 
 echo
 echo "=== smoke: new menu commands present ==="
-printf '10\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menushield.out" 2>&1 || true
+printf '10\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menumaint.out" 2>&1 || true
+check "menu shows maint entry"          "grep -q 'Maintenance' '$SANDBOX/menumaint.out'"
+printf '11\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menushield.out" 2>&1 || true
 check "menu shows shield entry"         "grep -q 'Bot & Scanner Shield' '$SANDBOX/menushield.out'"
-printf '11\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menugeo.out" 2>&1 || true
+printf '12\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menugeo.out" 2>&1 || true
 check "menu shows geo entry"            "grep -q 'GeoIP Country Filter' '$SANDBOX/menugeo.out'"
 bash "$HERE/vpssec" geo list > "$SANDBOX/geocmd.out" 2>&1 || true
 check "vpssec geo list works"           "grep -q 'GeoIP country filter' '$SANDBOX/geocmd.out'"
@@ -474,7 +478,29 @@ check "uninstall removes geo.conf"           "[ ! -f '$VPSSEC_CONF_DIR/geo.conf'
 check "uninstall removes shield conf"        "[ ! -f '$VPSSEC_CONF_DIR/botshield.conf' ]"
 check "uninstall wipes state dir"            "[ ! -d '$VPSSEC_STATE_DIR' ] || [ -z \"\$(ls -A '$VPSSEC_STATE_DIR' 2>/dev/null)\" ]"
 check "uninstall removes systemd units"      "[ ! -f '$VPSSEC_SYSTEMD_DIR/vps-security-monitor.timer' ] && [ ! -f '$VPSSEC_SYSTEMD_DIR/vps-security-geo.timer' ]"
+check "uninstall removes maint timer"        "[ ! -f '$VPSSEC_SYSTEMD_DIR/vps-security-maint.timer' ]"
 check "uninstall removes install dir"        "[ ! -d '$SANDBOX/opt/vps-security' ]"
+
+echo
+echo "=== smoke: maintenance — RAM cache & log cleanup ==="
+LOGDIR="$SANDBOX/varlog"
+mkdir -p "$LOGDIR"
+printf 'rotated' > "$LOGDIR/auth.log.1"
+printf 'rotated' > "$LOGDIR/syslog.2.gz"
+yes x | head -c 4096 | tr -d '\n' > "$LOGDIR/ufw.log"
+printf 'x%.0s' $(seq 1 2048) > "$LOGDIR/kern.log"
+rm -f "$SANDBOX/ufw.log"
+MAINT_LOG_DIR="$LOGDIR" MAINT_VACUUM_JOURNAL=0 UFW_LOG="$SANDBOX/ufw.log" \
+    bash "$HERE/lib/maintain.sh" --run > "$SANDBOX/maint.out" 2>&1 || true
+check "maint run reports success"          "grep -q 'Maintenance finished' '$SANDBOX/maint.out'"
+check "maint removed rotated .1 log"       "[ ! -f '$LOGDIR/auth.log.1' ]"
+check "maint removed rotated .gz log"      "[ ! -f '$LOGDIR/syslog.2.gz' ]"
+check "maint truncated active ufw.log"     "[ ! -s '$LOGDIR/ufw.log' ]"
+check "maint truncated active kern.log"    "[ ! -s '$LOGDIR/kern.log' ]"
+check "maint logged to maintain.log"       "grep -q 'maintenance finished' '$VPSSEC_STATE_DIR/maintain.log'"
+bash "$HERE/lib/maintain.sh" --status > "$SANDBOX/maintstat.out" 2>&1 || true
+check "maint status shows state"           "grep -q 'Maintenance' '$SANDBOX/maintstat.out'"
+check "vpssec maint status works"          "bash '$HERE/vpssec' maint status 2>&1 | grep -q 'Maintenance'"
 
 echo "==============================================="
 echo "SMOKE RESULT: PASS=$PASS FAIL=$FAIL"

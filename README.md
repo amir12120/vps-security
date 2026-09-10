@@ -10,6 +10,7 @@
 2. **SSH port change** — moves SSH off port 22 to a port you choose (with automatic rollback if sshd fails to come back)
 3. **Firewall (ufw)** — installs ufw, opens **only** the ports you approve and enables it. If you specify **no ports at all**, the firewall is left **disabled** and the server stays open on every port
 4. **Rogue-port monitor** — every 30 minutes scans live connections; any port **not** in your allow-list that is actively transferring data gets **blocked via ufw for 1 hour**, then automatically released
+5. **Maintenance** — every 2 days clears the RAM cache (`drop_caches`), removes rotated logs, truncates the usual active logs, and vacuums the systemd journal. Optional swap clear is **off by default** (on a busy VPS `swapoff` can trigger the OOM killer); enable it in `lib/maintain.sh` via `MAINT_CLEAR_SWAP=1`
 5. **Bot & Scanner Shield** — per-IP connection rate limits, TCP-flag scan drops (NULL / SYN+FIN / SYN+RST / ALL), and auto-ban of SYN-flooding IPs for one hour
 6. **GeoIP country filter** — allow **any number of countries** you choose (e.g. only Iran and Germany) and block every other country from reaching the server
 
@@ -61,6 +62,8 @@ Navigate with **↑/↓** (or `j`/`k`), select with **Enter**, go back with **q*
 | `sudo vpssec blocked` | View blocked ports + time until auto-release |
 | `sudo vpssec unblock [port]` | Release a blocked port immediately |
 | `sudo vpssec update` | Update vps-security from GitHub (`git pull` in place) |
+| `sudo vpssec maint run` | Run the RAM-cache & log cleanup right now |
+| `sudo vpssec maint status` | Maintenance timer state + recent runs |
 | `sudo vpssec shield status` | Bot & Scanner Shield state + banned IPs |
 | `sudo vpssec geo list` | GeoIP filter configuration |
 | `sudo vpssec logs [n]` | Show monitor log |
