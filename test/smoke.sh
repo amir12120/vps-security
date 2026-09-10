@@ -344,6 +344,15 @@ rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --disable > /dev/null 2>&1 || true
 check "shield disable removes flag drops" "! grep -q 'vps-security botshield BEGIN' '$UFW_DIR/before.rules'"
 check "shield disable clears conf"      "grep -q 'SHIELD_ENABLED=0' '$VPSSEC_CONF_DIR/botshield.conf'"
+# disable must release every active ban (timer is gone, nothing else would expire them)
+printf '%s|198.51.100.99\n' "$(date +%s)" > "$VPSSEC_STATE_DIR/shield-bans.list"
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --disable > /dev/null 2>&1 || true
+check "shield disable releases active bans" "! grep -q '198.51.100.99' '$VPSSEC_STATE_DIR/shield-bans.list' && grep -q 'delete deny from 198.51.100.99' '$SANDBOX/ufw.log'"
+# scan must be a no-op while disabled (zombie guard)
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
+check "disabled shield never bans (zombie guard)" "! grep -q 'deny from' '$SANDBOX/ufw.log'"
 
 echo
 echo "=== smoke: GeoIP country filter ==="

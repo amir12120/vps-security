@@ -181,6 +181,8 @@ ip_hits() {
 # connections to protected ports.
 scan_and_ban() {
     command -v ss >/dev/null 2>&1 || return 0
+    # zombie guard: never scan/ban while the shield is disabled
+    shield_is_enabled || return 0
     load_shield_conf
     local ports_csv
     ports_csv="$(shield_ports "$SHIELD_PORTS")"
@@ -268,6 +270,16 @@ shield_disable() {
     local sp
     sp="$(grep -E '^\s*Port\s+' "${VPSSEC_SSHD_CONFIG:-/etc/ssh/sshd_config}" 2>/dev/null | tail -1 | awk '{print $2}')"
     [ -z "$sp" ] && sp="22"
+    # SAFETY: release ALL active bans first — the maintenance timer that
+    # expires bans is being removed, so without this every banned IP
+    # would stay banned forever with no expiry mechanism.
+    if [ -f "$BANS_FILE" ]; then
+        local ts ip
+        while IFS='|' read -r ts ip || [ -n "${ts:-}" ]; do
+            [ -z "${ts:-}" ] && continue
+            unban_ip "$ip"
+        done < "$BANS_FILE"
+    fi
     remove_limit_rules "$SHIELD_PORTS" "$sp"
     remove_flag_drops
     if have_iptables && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -q active; then

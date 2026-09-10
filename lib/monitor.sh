@@ -72,6 +72,12 @@ block_port() {
     [ -f "$MONITOR_CONF" ] && . "$MONITOR_CONF" 2>/dev/null
     self_port="${MONITOR_SELF_PORT:-}"
     guard_port="${MONITOR_GUARD_PORT:-}"
+    # Defense in depth: always protect the CURRENT sshd port too, even
+    # when monitor.conf is missing (e.g. after an empty-ports install)
+    # so a manual scan can never lock the administrator out.
+    if [ -z "$self_port" ]; then
+        self_port="$(grep -E '^\s*Port\s+' "${VPSSEC_SSHD_CONFIG:-/etc/ssh/sshd_config}" 2>/dev/null | tail -1 | awk '{print $2}')"
+    fi
     if [ "$port" = "$self_port" ] || [ "$port" = "$guard_port" ]; then
         printf '%s SKIP %s (own control port)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$port" >> "$MONITOR_LOG"
         return 0
