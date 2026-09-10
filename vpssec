@@ -1,0 +1,506 @@
+#!/usr/bin/env bash
+# ============================================================
+# vpssec — interactive security CLI for Ubuntu servers
+#
+# Usage: sudo vpssec            (menu)
+#        sudo vpssec <command>  (direct)
+#
+# Commands:
+#   install      First-time setup (update, SSH port, firewall, monitor)
+#   status       Show firewall, SSH and monitor status
+#   ports        View / add / remove allowed ports
+#   port         Change the SSH port
+#   monitor      View monitor status and recent events
+#   unblock      Remove a port from the block list
+#   logs         Show monitor log
+#   uninstall    Remove vps-security completely
+#   help         Show this help
+# ============================================================
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+. "$SCRIPT_DIR/lib/common.sh"
+
+VERSION="1.0.0"
+INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
+
+# Sandbox-overridable system paths (test suite redirects these)
+SSH_CFG="${VPSSEC_SSHD_CONFIG:-/etc/ssh/sshd_config}"
+SYSTEMCTL="${VPSSEC_SYSTEMCTL:-systemctl}"
+
+svc_restart_ssh() {
+    $SYSTEMCTL restart sshd 2>/dev/null || $SYSTEMCTL restart ssh 2>/dev/null || service ssh restart
+}
+
+# ============================================================
+# Helpers
+# ============================================================
+
+prompt() { printf "%b" "${BOLD}$*${RESET}" >&2; }
+
+read_port() {
+    local label="$1" default="${2:-}" val
+    while :; do
+        if [ -n "$default" ]; then
+            prompt "$label [$default]: "
+        else
+            prompt "$label: "
+        fi
+        read -r val
+        [ -z "$val" ] && val="$default"
+        if is_valid_port "$val"; then
+            printf '%s\n' "$val"
+            return 0
+        fi
+        warn "Enter a valid port (1-65535)."
+    done
+}
+
+read_confirm() {
+    local q="$1" def="${2:-y}" a
+    prompt "$q"
+    read -r a
+    [ -z "$a" ] && a="$def"
+    case "$a" in
+        [Yy]|[Yy][Ee][Ss]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+pause_menu() {
+    echo
+    prompt "Press Enter to return to the menu..."
+    read -r _
+}
+
+ssh_port_in_config() {
+    grep -E '^\s*Port\s+' "$SSH_CFG" 2>/dev/null | tail -1 | awk '{print $2}'
+}
+
+set_ssh_port() {
+    local new="$1"
+    if grep -qE '^\s*Port\s+' "$SSH_CFG"; then
+        sed -i -E "s/^[#[:space:]]*Port[[:space:]].*/Port $new/" "$SSH_CFG"
+    else
+        printf '\nPort %s\n' "$new" >> "$SSH_CFG"
+    fi
+}
+
+# ============================================================
+# Command implementations
+# ============================================================
+
+cmd_install() {
+    need_root
+    require_debian_like
+    ensure_dirs
+
+    echo
+    echo "=============================================="
+    echo "  vps-security $VERSION — guided setup"
+    echo "=============================================="
+    echo
+    info "This setup will:"
+    echo "  1. Run 'apt update && apt upgrade -y'"
+    echo "  2. Change the SSH port to a new one you choose"
+    echo "  3. Install ufw, open the ports you approve, enable the firewall"
+    echo "  4. Install a monitor that auto-blocks rogue ports for 1 hour"
+    echo
+
+    # ------------------------------------------------
+    # Step 1 — system update
+    # ------------------------------------------------
+    if read_confirm "Step 1/4 — run 'apt update && apt upgrade -y' now? [Y/n] "; then
+        info "Updating package lists and upgrading packages (this can take a while)..."
+        apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+        ok "System is up to date."
+    else
+        warn "Skipping system update."
+    fi
+    echo
+
+    # ------------------------------------------------
+    # Step 2 — SSH port
+    # ------------------------------------------------
+    local current_port new_port
+    current_port="$(ssh_port_in_config)"
+    [ -z "$current_port" ] && current_port="22"
+
+    echo "Step 2/4 — SSH port"
+    info "Current SSH port: $current_port"
+    new_port="$(read_port "New SSH port" "$current_port")"
+
+    if [ "$new_port" != "$current_port" ]; then
+        # Old port must stay reachable until the new one is confirmed
+        if command -v ufw >/dev/null 2>&1; then
+            ufw allow "$current_port"/tcp >/dev/null 2>&1 || true
+        fi
+
+        info "Backing up and updating $SSH_CFG..."
+        cp "$SSH_CFG" "$SSH_CFG.bak.$(date +%s)"
+        set_ssh_port "$new_port"
+
+        info "Validating and restarting sshd..."
+        if sshd -t 2>/dev/null; then
+            svc_restart_ssh
+            sleep 1
+            if ss -tlnp 2>/dev/null | grep -q ":$new_port "; then
+                ok "SSH is now listening on port $new_port."
+                ufw allow "$new_port"/tcp >/dev/null 2>&1 || true
+                if read_confirm "Close old port $current_port now? [Y/n] "; then
+                    ufw delete allow "$current_port"/tcp >/dev/null 2>&1 || true
+                    ok "Old port $current_port closed."
+                else
+                    info "Old port left open — close it later with: sudo vpssec ports"
+                fi
+                current_port="$new_port"
+            else
+                err "SSH did not come up on the new port — rolling back."
+                cp "$(ls -t "$SSH_CFG".bak.* 2>/dev/null | head -1)" "$SSH_CFG"
+                svc_restart_ssh
+                die "SSH port change failed; original config restored."
+            fi
+        else
+            cp "$(ls -t "$SSH_CFG".bak.* 2>/dev/null | head -1)" "$SSH_CFG"
+            die "sshd_config validation failed — no change was made."
+        fi
+    else
+        ok "SSH port unchanged ($current_port)."
+    fi
+    echo
+
+    # ------------------------------------------------
+    # Step 3 — firewall
+    # ------------------------------------------------
+    echo "Step 3/4 — Firewall (ufw)"
+    ensure_dirs
+    touch "$ALLOWED_PORTS_CONF"
+    if [ -s "$ALLOWED_PORTS_CONF" ]; then
+        info "Existing allowed ports: $(tr '\n' ' ' < "$ALLOWED_PORTS_CONF")"
+    fi
+
+    info "Enter the ports to keep open, one per line. Empty line = finish."
+    info "SSH port $current_port is added automatically."
+    grep -qx "$current_port" "$ALLOWED_PORTS_CONF" || echo "$current_port" >> "$ALLOWED_PORTS_CONF"
+
+    local p
+    while :; do
+        prompt "  Port (blank to finish): "
+        read -r p
+        [ -z "$p" ] && break
+        if ! is_valid_port "$p"; then
+            warn "Invalid port."
+            continue
+        fi
+        if grep -qx "$p" "$ALLOWED_PORTS_CONF"; then
+            info "  $p is already in the list."
+            continue
+        fi
+        echo "$p" >> "$ALLOWED_PORTS_CONF"
+        ok "  $p added."
+    done
+
+    info "Installing ufw..."
+    apt-get install -y ufw >/dev/null 2>&1 || true
+    ufw --force reset >/dev/null 2>&1 || true
+    while IFS= read -r p || [ -n "$p" ]; do
+        p="${p%%#*}"; p="$(printf '%s' "$p" | tr -d '[:space:]')"
+        [ -z "$p" ] && continue
+        ufw allow "$p"/tcp >/dev/null
+        ufw allow "$p"/udp >/dev/null
+    done < "$ALLOWED_PORTS_CONF"
+    ufw --force enable
+    ufw status verbose
+    ok "Firewall enabled — only the approved ports are open."
+    echo
+
+    # ------------------------------------------------
+    # Step 4 — rogue-port monitor
+    # ------------------------------------------------
+    echo "Step 4/4 — Rogue-port monitor"
+    info "Every 30 minutes the server is scanned for connections on ports"
+    info "outside your allow-list. A rogue port carrying traffic is blocked"
+    info "via ufw for one hour, then automatically released."
+    local guard_port
+    guard_port="$(read_port "Local API port for the monitor (for the future dashboard)" "18080")"
+    cat > "$MONITOR_CONF" <<EOF
+MONITOR_SELF_PORT=$current_port
+MONITOR_GUARD_PORT=$guard_port
+EOF
+    chmod 600 "$MONITOR_CONF"
+
+    if read_confirm "Open the monitor API port $guard_port on the firewall? [y/N] " "n"; then
+        ufw allow "$guard_port"/tcp >/dev/null
+        ufw allow "$guard_port"/udp >/dev/null
+        ok "Monitor API port $guard_port open."
+    else
+        info "Monitor API stays local-only. Add it later with: sudo vpssec ports"
+    fi
+    if read_confirm "Run a first monitor scan now? [Y/n] "; then
+        "$SCRIPT_DIR/lib/monitor.sh" --scan || true
+    fi
+
+    install_systemd "$current_port" "$guard_port"
+
+    echo
+    echo "=============================================="
+    ok "vps-security setup complete!"
+    echo "=============================================="
+    echo
+    info "SSH       : port $current_port"
+    info "Firewall  : ufw active, allowed ports: $(tr '\n' ' ' < "$ALLOWED_PORTS_CONF" | tr -s ' ')"
+    info "Monitor   : every 30 min, 1-hour auto-block, guard port $guard_port"
+    echo
+    info "CLI       : sudo vpssec"
+    info "Status    : sudo vpssec status"
+    info "Monitor   : sudo vpssec monitor"
+    echo
+}
+
+install_systemd() {
+    local ssh_port="$1" guard_port="$2"
+    info "Installing systemd service and timer..."
+    mkdir -p "$INSTALL_DIR"
+    cp -r "$SCRIPT_DIR/lib" "$INSTALL_DIR/"
+    chmod 755 "$INSTALL_DIR/lib/"*.sh
+
+    cat > "$VPSSEC_SYSTEMD_DIR/vps-security-monitor.service" <<EOF
+[Unit]
+Description=vps-security rogue-port monitor
+After=network-online.target ufw.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/lib/monitor.sh --scan
+EOF
+
+    cat > "$VPSSEC_SYSTEMD_DIR/vps-security-monitor.timer" <<EOF
+[Unit]
+Description=Run vps-security monitor every 30 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+Unit=vps-security-monitor.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    cat > "$VPSSEC_SYSTEMD_DIR/vps-security-guard.service" <<EOF
+[Unit]
+Description=vps-security local guard API
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$INSTALL_DIR/lib/guard.sh --serve --port $guard_port
+Restart=always
+RestartSec=5
+EOF
+
+    $SYSTEMCTL daemon-reload
+    $SYSTEMCTL enable --now vps-security-monitor.timer
+    $SYSTEMCTL restart vps-security-guard.service
+    ok "Monitor timer armed (every 30 min) and guard service started."
+}
+
+cmd_status() {
+    need_root
+    echo
+    echo "================= vps-security status ================="
+    echo
+    echo "--- Firewall (ufw) ---"
+    if command -v ufw >/dev/null 2>&1; then
+        ufw status verbose
+    else
+        warn "ufw is not installed."
+    fi
+    echo
+    echo "--- SSH ---"
+    echo "Configured SSH port : $(ssh_port_in_config || echo '22 (default)')"
+    ss -tlnp 2>/dev/null | grep -i ssh || true
+    echo
+    "$SCRIPT_DIR/lib/monitor.sh" --status || true
+    echo
+    echo "--- Services ---"
+    $SYSTEMCTL is-active vps-security-monitor.timer >/dev/null 2>&1 \
+        && ok "monitor timer: active" || warn "monitor timer: not installed/inactive"
+    $SYSTEMCTL is-active vps-security-guard.service >/dev/null 2>&1 \
+        && ok "guard service: active" || warn "guard service: not installed/inactive"
+    echo
+}
+
+cmd_ports() {
+    need_root
+    ensure_dirs
+    touch "$ALLOWED_PORTS_CONF"
+    while :; do
+        echo
+        echo "=========== Allowed ports ==========="
+        list_ports
+        echo
+        echo " 1) Add port    2) Remove port    0) Back"
+        prompt "Choice: "
+        read -r c
+        case "$c" in
+            1)
+                local p
+                p="$(read_port "Port to add" "")"
+                if grep -qx "$p" "$ALLOWED_PORTS_CONF"; then
+                    info "Already in the list."
+                else
+                    echo "$p" >> "$ALLOWED_PORTS_CONF"
+                    ufw allow "$p"/tcp >/dev/null 2>&1
+                    ufw allow "$p"/udp >/dev/null 2>&1
+                    ok "Port $p added and opened in ufw."
+                fi
+                ;;
+            2)
+                local p
+                p="$(read_port "Port to remove" "")"
+                if grep -qx "$p" "$ALLOWED_PORTS_CONF"; then
+                    sed -i "/^${p}\$/d" "$ALLOWED_PORTS_CONF"
+                    ufw delete allow "$p"/tcp >/dev/null 2>&1
+                    ufw delete allow "$p"/udp >/dev/null 2>&1
+                    ok "Port $p removed and closed in ufw."
+                else
+                    warn "Port $p is not in the list."
+                fi
+                ;;
+            0) return 0 ;;
+            *) warn "Unknown choice." ;;
+        esac
+    done
+}
+
+list_ports() {
+    local n=0 p
+    while IFS= read -r p || [ -n "$p" ]; do
+        p="${p%%#*}"; p="$(printf '%s' "$p" | tr -d '[:space:]')"
+        [ -z "$p" ] && continue
+        n=$((n + 1))
+        printf '  %2d) %s\n' "$n" "$p"
+    done < "$ALLOWED_PORTS_CONF"
+    [ "$n" -eq 0 ] && echo "  (empty)"
+}
+
+cmd_port() {
+    need_root
+    local cur new
+    cur="$(ssh_port_in_config)"
+    [ -z "$cur" ] && cur="22"
+    info "Current SSH port: $cur"
+    new="$(read_port "New SSH port" "$cur")"
+    [ "$new" = "$cur" ] && { ok "Unchanged."; return 0; }
+    ufw allow "$new"/tcp >/dev/null 2>&1 || true
+    cp "$SSH_CFG" "$SSH_CFG.bak.$(date +%s)"
+    set_ssh_port "$new"
+    if sshd -t 2>/dev/null; then
+        svc_restart_ssh
+        ok "SSH port changed to $new (old port $cur left open — remove it with 'vpssec ports')."
+    else
+        cp "$(ls -t "$SSH_CFG".bak.* 2>/dev/null | head -1)" "$SSH_CFG"
+        die "Port change failed — config restored."
+    fi
+}
+
+cmd_monitor() {
+    "$SCRIPT_DIR/lib/monitor.sh" --status
+}
+
+cmd_unblock() {
+    need_root
+    local p="${1:-}"
+    if [ -z "$p" ]; then
+        p="$(read_port "Port to unblock now" "")"
+    fi
+    "$SCRIPT_DIR/lib/monitor.sh" --unblock "$p"
+}
+
+cmd_logs() {
+    ensure_dirs
+    local f="$VPSSEC_STATE_DIR/monitor.log"
+    [ -f "$f" ] || { info "No monitor log yet."; return 0; }
+    tail -n "${2:-50}" "$f"
+}
+
+cmd_uninstall() {
+    need_root
+    if ! read_confirm "Remove vps-security completely (monitor, guard, CLI; ufw rules stay)? [y/N] " "n"; then
+        info "Aborted."
+        return 0
+    fi
+    $SYSTEMCTL disable --now vps-security-monitor.timer 2>/dev/null || true
+    $SYSTEMCTL stop vps-security-guard.service 2>/dev/null || true
+    rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-monitor.{service,timer}
+    rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-guard.service
+    $SYSTEMCTL daemon-reload
+    rm -rf "$INSTALL_DIR"
+    rm -f /usr/local/bin/vpssec
+    ok "vps-security removed. Firewall rules and SSH config were left untouched."
+}
+
+cmd_help() {
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# ============================================================
+# Menu
+# ============================================================
+
+show_menu() {
+    while :; do
+        echo
+        echo "=============================================="
+        echo "   vps-security $VERSION"
+        echo "=============================================="
+        echo " 1) Guided install (update/SSH/firewall/monitor)"
+        echo " 2) Status"
+        echo " 3) Manage allowed ports"
+        echo " 4) Change SSH port"
+        echo " 5) Monitor status and events"
+        echo " 6) Unblock a port now"
+        echo " 7) Logs"
+        echo " 8) Uninstall"
+        echo " 0) Exit"
+        echo "=============================================="
+        prompt "Select: "
+        read -r choice
+        case "$choice" in
+            1) cmd_install ;;
+            2) cmd_status ;;
+            3) cmd_ports ;;
+            4) cmd_port ;;
+            5) cmd_monitor ;;
+            6) cmd_unblock ;;
+            7) cmd_logs ;;
+            8) cmd_uninstall ;;
+            0) exit 0 ;;
+            *) warn "Unknown option." ;;
+        esac
+        pause_menu
+    done
+}
+
+# ============================================================
+# Dispatcher
+# ============================================================
+
+case "${1:-}" in
+    "")        show_menu ;;
+    install)   shift; cmd_install "$@" ;;
+    status)    cmd_status ;;
+    ports)     cmd_ports ;;
+    port)      cmd_port ;;
+    monitor)   cmd_monitor ;;
+    unblock)   shift; cmd_unblock "$@" ;;
+    logs)      shift; cmd_logs "$@" ;;
+    uninstall) cmd_uninstall ;;
+    help|-h|--help) cmd_help ;;
+    *) die "Unknown command: $1 (try 'vpssec help')" ;;
+esac

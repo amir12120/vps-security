@@ -1,0 +1,5 @@
+*.log
+.dbg*
+*.db
+node_modules/
+__pycache__/

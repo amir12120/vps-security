@@ -1,0 +1,37 @@
+name: Deploy Smoke Test
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: Deploy Smoke Test (stubbed install + monitor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shell syntax check (all scripts)
+        run: |
+          bash -n install.sh
+          bash -n vpssec
+          bash -n lib/common.sh
+          bash -n lib/monitor.sh
+          bash -n lib/guard.sh
+          bash -n scripts/update.sh
+          bash -n test/smoke.sh
+          echo "all scripts pass bash -n"
+
+      - name: ShellCheck (non-blocking)
+        continue-on-error: true
+        uses: ludeeus/action-shellcheck@master
+        with:
+          ignore_paths: test
+
+      - name: Run smoke test suite
+        run: |
+          chmod +x vpssec lib/*.sh test/*.sh scripts/*.sh
+          bash test/smoke.sh
