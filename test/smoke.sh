@@ -71,10 +71,13 @@ cat > "$STUBS/ss" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
     *tlnp*)
-        cat <<'TABLE'
+        # stateful: report sshd as listening on whatever Port the sandboxed
+        # sshd_config currently has (used by install/port change verification)
+        port="$(grep -E '^Port ' "${VPSSEC_SSHD_CONFIG:-/etc/ssh/sshd_config}" 2>/dev/null | tail -1 | awk '{print $2}')"
+        [ -z "$port" ] && port=22
+        cat <<TABLE
 State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process
-LISTEN 0      128    0.0.0.0:2222       0.0.0.0:*
-LISTEN 0      128    0.0.0.0:22         0.0.0.0:*
+LISTEN 0      128    0.0.0.0:$port      0.0.0.0:*
 LISTEN 0      128    0.0.0.0:443        0.0.0.0:*
 TABLE
         ;;
@@ -158,6 +161,30 @@ check "allowed-ports list written"      "grep -q '^2222$' '$VPSSEC_CONF_DIR/allo
 check "monitor conf written"            "grep -q 'MONITOR_SELF_PORT=2222' '$VPSSEC_CONF_DIR/monitor.conf' && grep -q 'MONITOR_GUARD_PORT=18080' '$VPSSEC_CONF_DIR/monitor.conf'"
 check "monitor timer unit installed"    "grep -q 'monitor.sh --scan' '$VPSSEC_SYSTEMD_DIR/vps-security-monitor.service' && grep -q 'OnUnitActiveSec=30min' '$VPSSEC_SYSTEMD_DIR/vps-security-monitor.timer'"
 check "timer enabled via systemctl"     "grep -q 'enable --now vps-security-monitor.timer' '$SANDBOX/systemctl.log'"
+
+echo
+echo "=== smoke: standalone SSH port change opens ufw + allow-list BEFORE switching ==="
+rm -f "$SANDBOX/ufw.log"
+printf '3333\n' | UFW_LOG="$SANDBOX/ufw.log" SYSTEMCTL_LOG="$SANDBOX/systemctl.log" \
+    bash "$HERE/vpssec" port > "$SANDBOX/port.out" 2>&1 || true
+check "port cmd changed config to 3333"  "grep -q '^Port 3333$' '$SSH_CFG'"
+check "port cmd opened ufw 3333/tcp"     "grep -q 'allow 3333/tcp' '$SANDBOX/ufw.log'"
+check "port cmd opened ufw 3333/udp"     "grep -q 'allow 3333/udp' '$SANDBOX/ufw.log'"
+check "port cmd added 3333 to allow list" "grep -q '^3333$' '$VPSSEC_CONF_DIR/allowed-ports.list'"
+check "port cmd synced MONITOR_SELF_PORT" "grep -q 'MONITOR_SELF_PORT=3333' '$VPSSEC_CONF_DIR/monitor.conf'"
+check "port cmd confirmed listening"     "grep -q 'now listening on port 3333' '$SANDBOX/port.out'"
+
+echo
+echo "=== smoke: failed SSH port change rolls everything back ==="
+printf '#!/usr/bin/env bash\nexit 1\n' > "$STUBS/sshd"   # sshd -t now fails
+rm -f "$SANDBOX/ufw.log"
+printf '4444\n' | UFW_LOG="$SANDBOX/ufw.log" \
+    bash "$HERE/vpssec" port > "$SANDBOX/port2.out" 2>&1 || true
+printf '#!/usr/bin/env bash\nexit 0\n' > "$STUBS/sshd"   # restore stub
+check "rollback restored config 3333"    "grep -q '^Port 3333$' '$SSH_CFG'"
+check "rollback removed 4444 from list"  "! grep -q '^4444$' '$VPSSEC_CONF_DIR/allowed-ports.list'"
+check "rollback deleted ufw 4444 rules"  "grep -q 'delete allow 4444/tcp' '$SANDBOX/ufw.log'"
+check "rollback restored MONITOR_SELF_PORT" "grep -q 'MONITOR_SELF_PORT=3333' '$VPSSEC_CONF_DIR/monitor.conf'"
 
 echo
 echo "=== smoke: rogue-port monitor scan ==="

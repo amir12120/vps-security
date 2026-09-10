@@ -270,6 +270,12 @@ cmd_install() {
             if ss -tlnp 2>/dev/null | grep -q ":$new_port "; then
                 ok "SSH is now listening on port $new_port."
                 ufw allow "$new_port"/tcp >/dev/null 2>&1 || true
+                ufw allow "$new_port"/udp >/dev/null 2>&1 || true
+                # Register the new SSH port immediately (before Step 3) so the
+                # allow-list can never miss it, even if setup stops here.
+                ensure_dirs
+                touch "$ALLOWED_PORTS_CONF"
+                grep -qx "$new_port" "$ALLOWED_PORTS_CONF" 2>/dev/null || echo "$new_port" >> "$ALLOWED_PORTS_CONF"
                 if read_confirm "Close old port $current_port now? [Y/n] "; then
                     ufw delete allow "$current_port"/tcp >/dev/null 2>&1 || true
                     ok "Old port $current_port closed."
@@ -530,8 +536,12 @@ cmd_status() {
 action_port_add() {
     ensure_dirs
     touch "$ALLOWED_PORTS_CONF"
-    local p
+    local p sp
     p="$(read_port "Port to open (e.g. 443)" "")"
+    sp="$(ssh_port_in_config 2>/dev/null || echo 22)"
+    if [ "$p" = "$sp" ]; then
+        info "Port $p is the current SSH port — it is always open."
+    fi
     if grep -qx "$p" "$ALLOWED_PORTS_CONF" 2>/dev/null; then
         info "Port $p is already in the allowed list."
         return 0
@@ -703,14 +713,53 @@ cmd_port() {
     info "Current SSH port: $cur"
     new="$(read_port "New SSH port" "$cur")"
     [ "$new" = "$cur" ] && { ok "Unchanged."; return 0; }
-    ufw allow "$new"/tcp >/dev/null 2>&1 || true
+
+    # SAFETY FIRST — make the new port reachable BEFORE sshd switches:
+    # 1. open it in ufw (tcp+udp) so the firewall can never cut the session
+    # 2. register it in the allowed list so the rogue-port monitor and the
+    #    ports menu treat it as a legitimate port from now on
+    # 3. keep the monitor's own view of the SSH port in sync
+    ensure_dirs
+    touch "$ALLOWED_PORTS_CONF"
+    local new_was_listed=0
+    grep -qx "$new" "$ALLOWED_PORTS_CONF" 2>/dev/null && new_was_listed=1
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow "$new"/tcp >/dev/null 2>&1 || true
+        ufw allow "$new"/udp >/dev/null 2>&1 || true
+    fi
+    grep -qx "$new" "$ALLOWED_PORTS_CONF" 2>/dev/null || echo "$new" >> "$ALLOWED_PORTS_CONF"
+    if [ -f "$MONITOR_CONF" ] && grep -q '^MONITOR_SELF_PORT=' "$MONITOR_CONF"; then
+        sed -i "s/^MONITOR_SELF_PORT=.*/MONITOR_SELF_PORT=$new/" "$MONITOR_CONF"
+    fi
+
     cp "$SSH_CFG" "$SSH_CFG.bak.$(date +%s)"
     set_ssh_port "$new"
     if sshd -t 2>/dev/null; then
         svc_restart_ssh
-        ok "SSH port changed to $new (old port $cur left open — remove it from Ports)."
+        sleep 1
+        if ss -tlnp 2>/dev/null | grep -q ":$new "; then
+            ok "SSH is now listening on port $new."
+            ok "Port $new was opened in ufw and added to the allowed list before the switch."
+            info "Old port $cur stays open — remove it from the Ports menu once you have confirmed the new one works."
+        else
+            cp "$(ls -t "$SSH_CFG".bak.* 2>/dev/null | head -1)" "$SSH_CFG"
+            svc_restart_ssh
+            [ "$new_was_listed" -eq 0 ] && sed -i "/^${new}\$/d" "$ALLOWED_PORTS_CONF" 2>/dev/null || true
+            if command -v ufw >/dev/null 2>&1; then
+                ufw delete allow "$new"/tcp >/dev/null 2>&1 || true
+                ufw delete allow "$new"/udp >/dev/null 2>&1 || true
+            fi
+            [ -f "$MONITOR_CONF" ] && sed -i "s/^MONITOR_SELF_PORT=.*/MONITOR_SELF_PORT=$cur/" "$MONITOR_CONF" 2>/dev/null
+            die "SSH did not come up on port $new — config restored."
+        fi
     else
         cp "$(ls -t "$SSH_CFG".bak.* 2>/dev/null | head -1)" "$SSH_CFG"
+        [ "$new_was_listed" -eq 0 ] && sed -i "/^${new}\$/d" "$ALLOWED_PORTS_CONF" 2>/dev/null || true
+        if command -v ufw >/dev/null 2>&1; then
+            ufw delete allow "$new"/tcp >/dev/null 2>&1 || true
+            ufw delete allow "$new"/udp >/dev/null 2>&1 || true
+        fi
+        [ -f "$MONITOR_CONF" ] && sed -i "s/^MONITOR_SELF_PORT=.*/MONITOR_SELF_PORT=$cur/" "$MONITOR_CONF" 2>/dev/null
         die "Port change failed — config restored."
     fi
 }
