@@ -320,8 +320,8 @@ check "empty-ports install removes stale allow-list" "[ ! -f '$VPSSEC_CONF_DIR/a
 
 echo
 echo "=== smoke: help & version ==="
-bash "$HERE/vpssec" version | grep -q 'vpssec 1.2.1' && R=0 || R=1
-check "version reports 1.2.0"           "[ \"$R\" -eq 0 ]"
+bash "$HERE/vpssec" version | grep -q 'vpssec 1.3.0' && R=0 || R=1
+check "version reports 1.3.0"           "[ \"$R\" -eq 0 ]"
 bash "$HERE/vpssec" help | grep -q 'update' && R=0 || R=1
 check "help mentions update"            "[ \"$R\" -eq 0 ]"
 
@@ -501,6 +501,85 @@ check "maint logged to maintain.log"       "grep -q 'maintenance finished' '$VPS
 bash "$HERE/lib/maintain.sh" --status > "$SANDBOX/maintstat.out" 2>&1 || true
 check "maint status shows state"           "grep -q 'Maintenance' '$SANDBOX/maintstat.out'"
 check "vpssec maint status works"          "bash '$HERE/vpssec' maint status 2>&1 | grep -q 'Maintenance'"
+
+echo
+echo "=== smoke: Iranian mirror & DNS (GitHub speed criterion) ==="
+MS="$SANDBOX/mirror"
+mkdir -p "$MS/etc" "$MS/state"
+export VPSSEC_GITCONFIG="$MS/etc/gitconfig"
+export VPSSEC_RESOLV_CONF="$MS/etc/resolv.conf"
+export VPSSEC_RESOLVED_CONF_D="$MS/etc/resolved.d"
+# stub curl: mirror #2 answers fastest, mirror #1 slow, mirror #3 broken,
+# direct github FAIL — ensures the winner logic picks iranserver
+cat > "$STUBS/curl" <<'MCEOF'
+#!/usr/bin/env bash
+url=""; prev=""
+for a in "$@"; do case "$a" in http*|*github*) [ -z "$url" ] && url="$a";; esac; prev="$a"; done
+case "$url" in
+    *iranserver*) sleep 0.05; echo "200 0.050000" ;;
+    *gitclone*)   sleep 0.30; echo "200 0.300000" ;;
+    *theazizi*)   exit 7 ;;
+    *)            exit 7 ;;   # direct github.com unreachable in the sandbox
+esac
+MCEOF
+chmod +x "$STUBS/curl"
+# stub dig: 403.online answers in 5 ms, Radar in 20, Shecan in 30, rest fail
+cat > "$STUBS/dig" <<'DIGEOF'
+#!/usr/bin/env bash
+ns=""
+for a in "$@"; do case "$a" in @*) ns="${a#@}";; esac; done
+case "$ns" in
+    10.202.10.202)  echo ";; Query time: 5 msec" ;;
+    10.202.10.10)   echo ";; Query time: 20 msec" ;;
+    178.22.122.100) echo ";; Query time: 30 msec" ;;
+    *)              exit 1 ;;
+esac
+echo ";; status: NOERROR"
+echo "github.com. 300 IN A 140.82.121.4"
+DIGEOF
+chmod +x "$STUBS/dig"
+VPSSEC_CONF_DIR="$MS/etc" VPSSEC_STATE_DIR="$MS/state" VPSSEC_SKIP_ROOT_CHECK=1 VPSSEC_SKIP_OS_CHECK=1 \
+    bash "$HERE/lib/mirror.sh" --best > "$MS/best.out" 2>&1 <<'MANS'
+n
+MANS
+check "mirror flow found fastest"        "grep -q 'Fastest mirror: github.iranserver.com' '$MS/best.out'"
+check "unreachable mirror skipped"       "grep -q 'theazizi.*FAIL\|FAIL  (unreachable)' '$MS/best.out'"
+check "insteadOf written to gitconfig"   "grep -q 'insteadof = https://github.com/' '$MS/etc/gitconfig' && grep -q 'iranserver' '$MS/etc/gitconfig'"
+check "mirror choice persisted"          "grep -q 'MIRROR_NAME=github.iranserver.com' '$MS/etc/mirror.conf'"
+check "DNS unchanged when declined"      "grep -q 'DNS left unchanged' '$MS/best.out'"
+check "mirror logged"                    "grep -q 'mirror applied: github.iranserver.com' '$MS/state/mirror.log'"
+# DNS: answer 'y' this time; resolv.conf must get Radar (5ms beats Shecan 30ms)
+# pre-existing DNS gets backed up by apply_dns, then restored by --reset
+printf 'nameserver 8.8.8.8\n' > "$MS/etc/resolv.conf"
+printf 'y\n' | VPSSEC_CONF_DIR="$MS/etc" VPSSEC_STATE_DIR="$MS/state" VPSSEC_SKIP_ROOT_CHECK=1 VPSSEC_SKIP_OS_CHECK=1 \
+    bash "$HERE/lib/mirror.sh" --best > "$MS/best2.out" 2>&1 || true
+check "fastest DNS picked (403 5ms)"     "grep -q 'Fastest DNS: 403.online' '$MS/best2.out'"
+check "resolv.conf rewritten to 403"     "grep -q 'nameserver 10.202.10.202' '$MS/etc/resolv.conf'"
+check "dns choice persisted"             "grep -q 'DNS_NAME=403.online' '$MS/etc/mirror.conf'"
+VPSSEC_CONF_DIR="$MS/etc" VPSSEC_STATE_DIR="$MS/state" VPSSEC_SKIP_ROOT_CHECK=1 VPSSEC_SKIP_OS_CHECK=1 \
+    bash "$HERE/lib/mirror.sh" --reset > "$MS/reset.out" 2>&1 || true
+check "reset removes insteadOf rule"     "! grep -q 'insteadof' '$MS/etc/gitconfig' || ! [ -s '$MS/etc/gitconfig' ]"
+check "reset restores resolv.conf backup" "grep -q 'nameserver 8.8.8.8' '$MS/etc/resolv.conf'"
+check "reset clears mirror.conf"         "[ ! -f '$MS/etc/mirror.conf' ]"
+
+# status via CLI
+VPSSEC_CONF_DIR="$MS/etc" VPSSEC_STATE_DIR="$MS/state" VPSSEC_SKIP_ROOT_CHECK=1 VPSSEC_SKIP_OS_CHECK=1 \
+    bash "$HERE/vpssec" mirror status > "$MS/cli.out" 2>&1 || true
+check "vpssec mirror status works"       "grep -q 'Iranian mirror' '$MS/cli.out'"
+
+# menu shows the new entry
+printf '13\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menumirror.out" 2>&1 || true
+check "menu shows mirror entry"          "grep -q 'Iranian mirror & DNS' '$SANDBOX/menumirror.out'"
+
+# --- restore global curl stub for any later checks ---
+cat > "$STUBS/curl" <<'CEOF4'
+#!/usr/bin/env bash
+out="/dev/null"; prev=""
+for a in "\$@"; do case "\$prev" in -o) out="\$a";; esac; prev="\$a"; done
+printf '1.2.3.0/24\n' > "\$out"
+exit 0
+CEOF4
+chmod +x "$STUBS/curl"
 
 echo "==============================================="
 echo "SMOKE RESULT: PASS=$PASS FAIL=$FAIL"

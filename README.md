@@ -66,8 +66,18 @@ Navigate with **↑/↓** (or `j`/`k`), select with **Enter**, go back with **q*
 | `sudo vpssec maint status` | Maintenance timer state + recent runs |
 | `sudo vpssec shield status` | Bot & Scanner Shield state + banned IPs |
 | `sudo vpssec geo list` | GeoIP filter configuration |
+| `sudo vpssec mirror` | **The best Iranian mirror & DNS:** times every Iranian GitHub mirror and public DNS from this server, installs the fastest mirror system-wide and switches DNS — criterion: GitHub access speed |
 | `sudo vpssec logs [n]` | Show monitor log |
 | `sudo vpssec uninstall` | **Full cleanup:** removes everything, restores SSH to port 22, resets & disables ufw (keeping SSH reachable) |
+
+## The best Iranian mirror & DNS
+
+On Iranian servers, GitHub is often slow or unreachable. The **🏁 The best Iranian mirror & DNS** menu item (or `vpssec mirror`) fixes this by measurement, not guessing:
+
+1. **Mirrors** — probes every Iranian GitHub mirror (`gitclone.ir`, `github.iranserver.com`, `gitdl.theazizi.ir`) plus the direct route, timing real HTTPS fetches of the git smart-HTTP endpoint. The winner is installed **system-wide** via `git config --system url.<mirror>.insteadOf https://github.com/`, so every `git clone/pull/fetch` — including `vpssec update` — is redirected automatically.
+2. **DNS** — queries each Iranian public DNS (Shecan, 403.online, Radar, Begzar, Electro, Pishgaman, Shelter) for `github.com` and switches the server to the fastest answerer (systemd-resolved drop-in, or `/etc/resolv.conf` with backup otherwise). A backup makes the change fully reversible.
+
+`sudo vpssec mirror reset` undoes both changes (removes insteadOf, restores the original DNS). `sudo vpssec mirror status` shows what is applied.
 
 ## How the rogue-port monitor works
 
