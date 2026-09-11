@@ -537,7 +537,12 @@ EOF
     done
     cat <<EOF
 -A ufw-before-input -m set --match-set $IPSET_NAME src -j ACCEPT
--A ufw-before-input -j DROP
+# TUNNEL SAFETY: only NEW inbound connections are dropped. Replies to
+# connections this server opened itself (a tunnel client dialling a
+# foreign server, panel API calls, updates) are ESTABLISHED traffic and
+# must keep flowing — otherwise enabling the country filter would kill
+# every outbound tunnel. Loopback is never geo-filtered either.
+-A ufw-before-input ! -i lo -m conntrack --ctstate NEW -j DROP
 $MARK_END
 EOF
 }
@@ -560,7 +565,7 @@ geo_strip_if_unsafe() {
     if ! geo_ruleset_is_safe; then
         geo_remove_rules
         cmd_ipset destroy "$IPSET_NAME" 2>/dev/null || true
-        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -q active; then
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -qx 'Status: active'; then
             cmd_ufw reload >/dev/null 2>&1 || true
         fi
         printf '%s SAFETY allow-set empty — geo rules removed, server open to all\n' \
@@ -607,7 +612,7 @@ geo_enable() {
         return 1
     fi
     geo_write_rules || die "writing ufw rules failed."
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -q active; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -qx 'Status: active'; then
         cmd_ufw reload >/dev/null 2>&1 || true
     fi
 
@@ -650,7 +655,7 @@ EOF
 geo_disable() {
     load_geo_conf
     geo_remove_rules
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -q active; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -qx 'Status: active'; then
         cmd_ufw reload >/dev/null 2>&1 || true
     fi
     cmd_systemctl disable --now vps-security-geo.timer 2>/dev/null || true

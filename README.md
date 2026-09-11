@@ -85,14 +85,33 @@ On Iranian servers, GitHub is often slow or unreachable. The **🏁 The best Ira
 ## How the rogue-port monitor works
 
 - A systemd timer runs the scanner **every 30 minutes** (`OnBootSec=2min`, then `OnUnitActiveSec=30min`).
-- The scanner reads live connections from `ss -tunap` and collects the **local ports with active traffic** (established TCP, connected UDP).
-- Any such port **not** in `/etc/vps-security/allowed-ports.list` is added to ufw as `deny <port>/{tcp,udp}` for **3600 seconds**.
+- The scanner reads live sockets from `ss -tunap` and keeps only **services bound on a public address**: TCP ports with a `LISTEN` socket that is actually serving connections, and UDP ports bound outside the ephemeral range. Outbound sockets — the local ports your tunnels, panel API calls and updates use — are never candidates.
+- Any such port **not** in `/etc/vps-security/allowed-ports.list`, not declared as a tunnel port, and not already opened in ufw is added to ufw as `deny <port>/{tcp,udp}` for **3600 seconds**.
 - After the hour expires, the next scan removes the rule and logs `UNBLOCK`.
 - View currently blocked ports (with a live countdown) via the **⛔ View blocked ports** menu or `vpssec blocked`; release a port early via **🔓 Unblock a port** or `vpssec unblock <port>`.
 - The SSH port itself and the monitor's own ports are **never** blocked — even if they are not in the allow-list.
 - All actions are logged to `/var/lib/vps-security/port-blocks.log` and `/var/lib/vps-security/monitor.log`.
 
 > **Note:** the scanner sees ports with live connections. A port that only *listens* without transferring data is not flagged — this keeps the tool safe around services that legitimately listen (docker proxies, panel sockets, …).
+
+## Tunnels, reverse proxies and VPN servers
+
+These servers usually carry a tunnel, so nothing here may fight it. vps-security is built around that:
+
+- **Outbound connections are never touched.** A tunnel that dials a foreign server, a panel API call, a `git fetch` — all use kernel-assigned ephemeral ports, and the monitor ignores them completely. (Older builds blocked those source ports, which throttled the tunnel and filled ufw with junk rules.)
+- **Declare your tunnel ports** — `sudo vpssec tunnels add 8443,51820` or **🔌 Ports → 🚇 Tunnel ports**. A declared port is opened in the firewall, **never** blocked by the monitor, and **never** rate-limited by the shield.
+- **The shield never throttles a tunnel.** `ufw limit` drops a source after ~6 new connections in 30 s, and a busy tunnel peer looks exactly like that — tunnel ports are excluded from `ufw limit` and from the auto-ban scan.
+- **Peers are never banned blindly.** The shield refuses to ban loopback, RFC1918/CGNAT/link-local addresses and anything on your GeoIP *never block* list (`vpssec geo bypass <ip>`) — add the tunnel peer's IP there.
+- **Loopback services and the DNS resolver** are never flagged; the GeoIP filter never touches loopback traffic.
+- **The country filter only drops NEW inbound connections** (`--ctstate NEW`, `! -i lo`). Replies to connections *your server* opened keep flowing, so enabling GeoIP cannot kill an outbound tunnel — no matter which country the foreign server sits in.
+- **Reinstalling keeps your rules.** Before it resets ufw, the installer reads your existing `ALLOW` rules and re-applies them, so a tunnel or panel port you opened earlier survives setup.
+- **It tells you what it sees.** Install prints the ports listening right now and asks you to declare the tunnel ones; `vpssec status` lists the declared tunnel ports.
+
+```bash
+sudo vpssec tunnels add 8443      # declare (also opens it in ufw)
+sudo vpssec tunnels list          # show what is protected
+sudo vpssec tunnels remove 8443   # stop protecting it
+```
 
 ## Maintenance details
 
@@ -111,7 +130,8 @@ Everything is editable from the 🧹 **Maintenance** menu too (`vpssec maint`).
 
 Enable it from the **🛡️ Bot & Scanner Shield** menu (or `vpssec shield enable`):
 
-- **Rate limiting** — ufw `limit` rules on SSH and every protected port: more than **6 new connections per 30 s** from one IP are dropped (this kills port scanners and brute-force bots)
+- **Rate limiting** — ufw `limit` rules on SSH and every protected port: more than **6 new connections per 30 s** from one IP are dropped (this kills port scanners and brute-force bots). **Tunnel ports are excluded** — declare them with `vpssec tunnels add`.
+- **Ban safety** — IPs are never banned for loopback, private/CGNAT/link-local addresses, or peers on your GeoIP *never block* list; skips are logged.
 - **TCP-flag drops** — NULL scans, SYN+FIN, SYN+RST, and ALL-flags packets are dropped in ufw's `before.rules` (survives reboots and ufw reloads)
 - **Auto-ban** — an IP flooding a protected port with half-open connections (40+ SYN-RECV) is banned via `ufw deny from <ip>` for **one hour**; bans expire automatically (10-minute maintenance timer)
 - Manage banned IPs from the same menu: view the list with remaining time, or unban any IP instantly

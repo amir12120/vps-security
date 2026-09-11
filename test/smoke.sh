@@ -58,11 +58,17 @@ printf '# ufw before rules stub\n*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' >
 printf '#Stub sshd_config\nPort 22\n' > "$SSH_CFG"
 
 # ---------- stub: ufw ----------
+# UFW_STATUS_EXTRA lets a test inject `ufw status` rows so the "adopt the
+# admin's existing rules" logic can be verified.
 cat > "$STUBS/ufw" <<'EOF'
 #!/usr/bin/env bash
 echo "ufw $*" >> "${UFW_LOG:-/tmp/ufw.log}"
 case "$1" in
-    status) echo "Status: active"; echo "Logging: on";;
+    status)
+        echo "Status: active"
+        echo "Logging: on"
+        [ -n "${UFW_STATUS_EXTRA:-}" ] && [ -f "$UFW_STATUS_EXTRA" ] && cat "$UFW_STATUS_EXTRA"
+        ;;
 esac
 exit 0
 EOF
@@ -85,14 +91,55 @@ LISTEN 0      128    0.0.0.0:$port      0.0.0.0:*
 LISTEN 0      128    0.0.0.0:443        0.0.0.0:*
 TABLE
         ;;
+    *tulnH*)
+        # no-header listening table used by the installer's port hint
+        cat <<'TABLEH'
+tcp LISTEN 0 4096 0.0.0.0:9999 0.0.0.0:*
+tcp LISTEN 0 4096 0.0.0.0:8080 0.0.0.0:*
+udp UNCONN 0 0 127.0.0.53:53    0.0.0.0:*
+TABLEH
+        ;;
+    *-tan*)
+        # `ss -tan` has NO Netid column (unlike -tunap): the shield parses
+        # this exact layout, so the stub must reproduce it faithfully.
+        echo "State    Recv-Q   Send-Q     Local Address:Port     Peer Address:Port"
+        if [ -n "${SS_SYN_FLOOD:-}" ]; then
+            # 50 half-open connections from one peer, to exercise the ban logic
+            i=1
+            while [ "$i" -le 50 ]; do
+                echo "SYN-RECV 0        0         192.168.1.5:443         $SS_SYN_FLOOD:4$i"
+                i=$((i + 1))
+            done
+            exit 0
+        fi
+        echo "ESTAB    0        0         192.168.1.5:443         10.0.0.3:51002"
+        exit 0
+        ;;
     *)
+        # A realistic mix for a tunnelled server:
+        #   9999  rogue TCP service (bound + serving)  -> must be blocked
+        #   9998  rogue UDP service (bound, non-ephemeral) -> must be blocked
+        #   8080  a declared tunnel port                -> must be left alone
+        #   45892/41555 outbound tunnel sockets (source ports) -> never blocked
+        #   9997  loopback-only service                 -> never blocked
+        #   53    loopback resolver                     -> never blocked
         cat <<'TABLE'
 Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
-tcp   ESTAB  0      0      192.168.1.5:9999    10.0.0.9:51000
-tcp   ESTAB  0      0      192.168.1.5:2222    10.0.0.2:51001
-tcp   ESTAB  0      0      192.168.1.5:443     10.0.0.3:51002
-udp   ESTAB  0      0      192.168.1.5:9998    10.0.0.9:51003
-udp   UNCONN 0      0      127.0.0.53:53       0.0.0.0:*
+tcp   LISTEN 0      128    0.0.0.0:9999      0.0.0.0:*
+tcp   ESTAB  0      0      192.168.1.5:9999  10.0.0.9:51000
+tcp   LISTEN 0      128    0.0.0.0:8080      0.0.0.0:*
+tcp   ESTAB  0      0      192.168.1.5:8080  203.0.113.7:40000
+udp   UNCONN 0      0      0.0.0.0:9998      0.0.0.0:*
+udp   ESTAB  0      0      192.168.1.5:9998  10.0.0.9:51003
+tcp   LISTEN 0      128    0.0.0.0:2222      0.0.0.0:*
+tcp   ESTAB  0      0      192.168.1.5:2222  10.0.0.2:51001
+tcp   LISTEN 0      128    0.0.0.0:443       0.0.0.0:*
+tcp   ESTAB  0      0      192.168.1.5:443   10.0.0.3:51002
+tcp   ESTAB  0      0      192.168.1.5:45892 203.0.113.9:443
+udp   ESTAB  0      0      192.168.1.5:41555 203.0.113.9:51820
+tcp   LISTEN 0      128    127.0.0.1:9997    0.0.0.0:*
+tcp   ESTAB  0      0      127.0.0.1:9997    127.0.0.1:51234
+udp   UNCONN 0      0      127.0.0.53:53     0.0.0.0:*
 TABLE
         ;;
 esac
@@ -146,8 +193,8 @@ chmod +x "$STUBS/cp"
 
 echo "=== smoke: full guided install (piped answers) ==="
 # answers: update=y, ssh-port=2222, close-old=y, ports 443 8443, end,
-#          guard-port=18080, open-guard=n, first-scan=n
-printf 'y\n2222\ny\n443\n8443\n\n18080\nn\nn\n' \
+#          tunnels=n, guard-port=18080, open-guard=n, first-scan=n
+printf 'y\n2222\ny\n443\n8443\n\nn\n18080\nn\nn\n' \
     | UFW_LOG="$SANDBOX/ufw.log" APT_LOG="$SANDBOX/apt.log" SYSTEMCTL_LOG="$SANDBOX/systemctl.log" \
       bash "$HERE/vpssec" install > "$SANDBOX/install.out" 2>&1
 grep -E '✓|✗|error|Error|denied' "$SANDBOX/install.out" | tail -n 20 || true
@@ -194,6 +241,8 @@ check "rollback restored MONITOR_SELF_PORT" "grep -q 'MONITOR_SELF_PORT=3333' '$
 
 echo
 echo "=== smoke: rogue-port monitor scan ==="
+# 8080 is the admin's own tunnel: declared before the first scan.
+printf '8080\n' > "$VPSSEC_CONF_DIR/tunnel-ports.list"
 rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --scan > "$SANDBOX/scan.out" 2>&1
 if [ -s "$SANDBOX/scan.out" ]; then echo "--- scan.out ---"; cat "$SANDBOX/scan.out"; fi
@@ -203,6 +252,26 @@ check "rogue udp 9998 blocked"          "grep -q 'deny 9998/udp' '$SANDBOX/ufw.l
 check "unconnected udp 53 NOT blocked"  "! grep -q 'deny 53/' '$SANDBOX/ufw.log'"
 check "ssh port 2222 NOT blocked"       "! grep -q 'deny 2222/' '$SANDBOX/ufw.log'"
 check "allowed port 443 NOT blocked"    "! grep -q 'deny 443/' '$SANDBOX/ufw.log'"
+
+# ---- tunnel safety: outbound sockets and declared tunnel ports ----
+check "outbound tcp source port NOT blocked" "! grep -q 'deny 45892' '$SANDBOX/ufw.log'"
+check "outbound udp source port NOT blocked" "! grep -q 'deny 41555' '$SANDBOX/ufw.log'"
+check "loopback-only service NOT blocked"    "! grep -q 'deny 9997' '$SANDBOX/ufw.log'"
+check "tunnel port 8080 NOT blocked"         "! grep -q 'deny 8080' '$SANDBOX/ufw.log'"
+check "tunnel skip recorded in log"          "grep -q 'SKIP 8080 (declared tunnel port)' '$VPSSEC_STATE_DIR/monitor.log'"
+check "scan log names the tunnel ports"      "grep -q 'tunnel: 8080' '$VPSSEC_STATE_DIR/monitor.log'"
+check "blocked list has no tunnel port"      "! grep -qE '\|8080$' '$VPSSEC_STATE_DIR/blocked-ports.list'"
+
+# ---- a port the admin opened in ufw is approval in itself ----
+printf '9999/tcp                   ALLOW       Anywhere\n' > "$SANDBOX/ufw-status.txt"
+rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/blocked-ports.list"
+UFW_LOG="$SANDBOX/ufw.log" UFW_STATUS_EXTRA="$SANDBOX/ufw-status.txt" \
+    bash "$HERE/lib/monitor.sh" --scan > /dev/null 2>&1
+check "ufw-allowed port is respected"   "! grep -q 'deny 9999/tcp' '$SANDBOX/ufw.log'"
+# restore the plain status stub for the remaining scans
+printf '' > "$SANDBOX/ufw-status.txt"
+rm -f "$VPSSEC_STATE_DIR/blocked-ports.list"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --scan > /dev/null 2>&1
 check "blocks recorded with timestamp"  "grep -qE '^[0-9]+\|9999$' '$VPSSEC_STATE_DIR/blocked-ports.list' && grep -qE '^[0-9]+\|9998$' '$VPSSEC_STATE_DIR/blocked-ports.list'"
 check "BLOCK events logged"             "grep -q 'BLOCK 9999' '$VPSSEC_STATE_DIR/port-blocks.log' && grep -q 'BLOCK 9998' '$VPSSEC_STATE_DIR/port-blocks.log'"
 
@@ -228,6 +297,31 @@ UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" unblock 9999 > /dev/null 2>&1
 check "manual unblock removes rule"     "grep -q 'delete deny 9999/tcp' '$SANDBOX/ufw.log'"
 check "port removed from block list"    "! grep -q '|9999$' '$VPSSEC_STATE_DIR/blocked-ports.list'"
 check "manual unblock logged"           "grep -q 'manual unblock' '$VPSSEC_STATE_DIR/port-blocks.log'"
+
+echo
+echo "=== smoke: tunnel ports (CLI + dashboard) ==="
+rm -f "$VPSSEC_CONF_DIR/tunnel-ports.list" "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" tunnels add "8443,9999,9999,notaport" > "$SANDBOX/tunadd.out" 2>&1 || true
+check "tunnels add writes the list"     "grep -qx '8443' '$VPSSEC_CONF_DIR/tunnel-ports.list' && grep -qx '9999' '$VPSSEC_CONF_DIR/tunnel-ports.list'"
+check "duplicate tunnel port added once" "[ \"\$(grep -c '^9999\$' '$VPSSEC_CONF_DIR/tunnel-ports.list')\" -eq 1 ]"
+check "invalid tunnel port rejected"    "grep -q 'Ignoring invalid port: notaport' '$SANDBOX/tunadd.out'"
+check "declared tunnel port opened in ufw" "grep -q 'allow 8443/tcp' '$SANDBOX/ufw.log'"
+bash "$HERE/vpssec" tunnels list > "$SANDBOX/tunlist.out" 2>&1 || true
+check "tunnels list shows declared ports" "grep -q '8443' '$SANDBOX/tunlist.out' && grep -q '9999' '$SANDBOX/tunlist.out'"
+bash "$HERE/vpssec" status > "$SANDBOX/status2.out" 2>&1 || true
+check "dashboard shows tunnel ports"    "grep -q 'Tunnel ports' '$SANDBOX/status2.out'"
+bash "$HERE/vpssec" tunnels remove 9999 > /dev/null 2>&1 || true
+check "tunnels remove works"            "! grep -qx '9999' '$VPSSEC_CONF_DIR/tunnel-ports.list'"
+# undeclaring must restore normal monitoring of that port: the admin also
+# closes it again (declaring a tunnel port opens it), exactly as the Ports
+# menu does.
+sed -i '/^9999$/d' "$VPSSEC_CONF_DIR/allowed-ports.list"
+rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/blocked-ports.list"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --scan > /dev/null 2>&1
+check "undeclared port is monitored again" "grep -q 'deny 9999/tcp' '$SANDBOX/ufw.log'"
+# the still-declared tunnel port stays protected
+check "remaining tunnel port still safe" "! grep -q 'deny 8443' '$SANDBOX/ufw.log'"
+bash "$HERE/vpssec" tunnels remove 8443 > /dev/null 2>&1 || true
 
 echo
 echo "=== smoke: guard API ==="
@@ -313,13 +407,28 @@ echo "=== smoke: install with NO extra ports leaves firewall OFF ==="
 # answer NO extra ports (blank line immediately)
 rm -f "$VPSSEC_CONF_DIR/allowed-ports.list" "$VPSSEC_CONF_DIR/monitor.conf"
 rm -f "$SANDBOX/ufw.log"
-printf 'y\n3333\n\n' \
+printf 'y\n3333\n\nn\n' \
     | UFW_LOG="$SANDBOX/ufw.log" APT_LOG="$SANDBOX/apt.log" SYSTEMCTL_LOG="$SANDBOX/systemctl.log" \
       bash "$HERE/vpssec" install > "$SANDBOX/install2.out" 2>&1 || true
 check "empty-ports install warns firewall stays off" "grep -q 'firewall will NOT be enabled' '$SANDBOX/install2.out'"
 check "empty-ports install skips monitor"           "grep -q 'monitor skipped' '$SANDBOX/install2.out'"
 check "empty-ports install never enables ufw"       "! grep -q ' enable' '$SANDBOX/ufw.log'"
 check "empty-ports install removes stale allow-list" "[ ! -f '$VPSSEC_CONF_DIR/allowed-ports.list' ]"
+
+echo
+echo "=== smoke: install adopts the admin's existing ufw rules ==="
+# A tunnel/panel port opened before vps-security existed must survive the
+# ufw --force reset the installer performs.
+printf '7777/tcp                   ALLOW       Anywhere\n' > "$SANDBOX/ufw-pre.txt"
+rm -f "$VPSSEC_CONF_DIR/allowed-ports.list" "$SANDBOX/ufw.log"
+printf 'n\n\nn\n18080\nn\nn\nn\n' \
+    | UFW_STATUS_EXTRA="$SANDBOX/ufw-pre.txt" UFW_LOG="$SANDBOX/ufw.log" \
+      SYSTEMCTL_LOG="$SANDBOX/systemctl.log" \
+      bash "$HERE/vpssec" install > "$SANDBOX/install3.out" 2>&1 || true
+check "install announces adopted ports"  "grep -q 'already open in ufw' '$SANDBOX/install3.out'"
+check "adopted port kept in allow-list"   "grep -qx '7777' '$VPSSEC_CONF_DIR/allowed-ports.list'"
+check "adopted port re-opened after reset" "grep -q 'allow 7777/tcp' '$SANDBOX/ufw.log'"
+check "install hints at listening services" "grep -q 'Services listening right now' '$SANDBOX/install3.out'"
 
 echo
 echo "=== smoke: CLI invoked through a symlink (bootstrap layout) ==="
@@ -330,7 +439,7 @@ LINK_DIR="$SANDBOX/bin"
 mkdir -p "$LINK_DIR"
 if ln -s "$HERE/vpssec" "$LINK_DIR/vpssec" 2>/dev/null && [ -L "$LINK_DIR/vpssec" ]; then
     printf '0\n' | bash "$LINK_DIR/vpssec" > "$SANDBOX/linkmenu.out" 2>&1 || true
-    bash "$LINK_DIR/vpssec" version | grep -q 'vpssec 1.3.4' && R=0 || R=1
+    bash "$LINK_DIR/vpssec" version | grep -q 'vpssec 1.3.5' && R=0 || R=1
     check "symlinked CLI loads its libraries"  "[ \"$R\" -eq 0 ]"
     check "symlinked CLI draws the menu"       "grep -q 'Main Menu' '$SANDBOX/linkmenu.out'"
     check "symlinked CLI reports no load error" "! grep -q 'unbound variable\|No such file' '$SANDBOX/linkmenu.out'"
@@ -343,7 +452,7 @@ echo "=== smoke: guided install ends in the TUI menu (pty) ==="
 if command -v script >/dev/null 2>&1; then
     # answers: skip apt=n, keep SSH port=<blank>, no extra ports=<blank>,
     # then q in the menu. VPSSEC_NO_MENU=0 re-enables the post-install menu.
-    printf 'n\n\n\nq\n' | TERM=xterm VPSSEC_NO_MENU=0 timeout 60 \
+    printf 'n\n\n\nn\nq\n' | TERM=xterm VPSSEC_NO_MENU=0 timeout 60 \
         script -qec "bash '$HERE/vpssec' install" /dev/null > "$SANDBOX/ptymenu.out" 2>&1 || true
     # Only assert once the pty genuinely drove the run to completion;
     # otherwise this environment cannot host the test (skip, don't fail).
@@ -359,16 +468,23 @@ fi
 
 echo
 echo "=== smoke: help & version ==="
-bash "$HERE/vpssec" version | grep -q 'vpssec 1.3.4' && R=0 || R=1
+bash "$HERE/vpssec" version | grep -q 'vpssec 1.3.5' && R=0 || R=1
 check "version reports 1.3.3"           "[ \"$R\" -eq 0 ]"
 bash "$HERE/vpssec" help | grep -q 'update' && R=0 || R=1
 check "help mentions update"            "[ \"$R\" -eq 0 ]"
 
 echo
 echo "=== smoke: Bot & Scanner Shield ==="
-UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --enable "" > "$SANDBOX/shield.out" 2>&1 || true
+# enable with an explicit protected port so the checks below are
+# independent of the allow-list (the empty-ports install wiped it)
+rm -f "$SANDBOX/ufw.log"
+printf '8080\n' > "$VPSSEC_CONF_DIR/tunnel-ports.list"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --enable "443,8080" > "$SANDBOX/shield.out" 2>&1 || true
 SP="$(grep -E '^Port ' "$SSH_CFG" | tail -1 | awk '{print $2}')"; [ -z "$SP" ] && SP=22
 check "shield enabled"                  "grep -q 'Shield enabled' '$SANDBOX/shield.out'"
+check "shield rate-limits protected port" "grep -q 'limit 443/tcp' '$SANDBOX/ufw.log'"
+check "tunnel port is NEVER rate-limited" "! grep -q 'limit 8080/' '$SANDBOX/ufw.log'"
+check "tunnel port kept out of shield list" "! grep -q '8080' '$VPSSEC_CONF_DIR/botshield.conf'"
 check "shield conf written"             "grep -q 'SHIELD_ENABLED=1' '$VPSSEC_CONF_DIR/botshield.conf'"
 check "shield ufw limit on ssh"         "grep -qE 'limit (${SP})/tcp' '$SANDBOX/ufw.log'"
 check "shield timer installed"          "[ -f '$VPSSEC_SYSTEMD_DIR/vps-security-shield.timer' ]"
@@ -395,6 +511,22 @@ rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
 check "disabled shield never bans (zombie guard)" "! grep -q 'deny from' '$SANDBOX/ufw.log'"
 
+# ---- tunnel safety: never ban the server's own or the admin's peers ----
+printf 'GEO_ENABLED=0\nGEO_COUNTRIES=\nGEO_BYPASS=198.51.100.7\n' > "$VPSSEC_CONF_DIR/geo.conf"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --enable "443" > /dev/null 2>&1 || true
+rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/shield-bans.list"
+# a real attacker on 443 gets banned
+SS_SYN_FLOOD=203.0.113.9 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
+check "SYN flood from a public IP is banned" "grep -q 'deny from 203.0.113.9' '$SANDBOX/ufw.log'"
+# a private peer is never banned (that is the tunnel talking to itself)
+SS_SYN_FLOOD=10.0.0.9 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
+check "private peer is never banned"        "! grep -q 'deny from 10.0.0.9' '$SANDBOX/ufw.log'"
+# a declared trusted peer (GeoIP bypass) is never banned either
+SS_SYN_FLOOD=198.51.100.7 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
+check "trusted peer is never banned"        "! grep -q 'deny from 198.51.100.7' '$SANDBOX/ufw.log'"
+check "skipped bans are logged"             "grep -q 'SKIP-BAN 10.0.0.9' '$VPSSEC_STATE_DIR/shield.log' && grep -q 'SKIP-BAN 198.51.100.7' '$VPSSEC_STATE_DIR/shield.log'"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --disable > /dev/null 2>&1 || true
+
 echo
 echo "=== smoke: GeoIP country filter ==="
 # sandboxed curl that returns CIDR content for any country
@@ -419,7 +551,8 @@ UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --enable > "$SANDBOX/geoena
 check "geo enable downloads lists"      "grep -q '^1.2.3.0/24$' '$VPSSEC_STATE_DIR/geo/IR.cidr' && grep -q '^1.2.3.0/24$' '$VPSSEC_STATE_DIR/geo/DE.cidr'"
 check "geo enable writes before.rules"  "grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
 check "geo enable writes ipset rule"    "grep -q 'match-set vpssec_geo_allow src' '$UFW_DIR/before.rules'"
-check "geo enable writes final DROP"    "grep -q -- '-A ufw-before-input -j DROP' '$UFW_DIR/before.rules'"
+check "geo enable writes final DROP"    "grep -q -- '-A ufw-before-input ! -i lo -m conntrack --ctstate NEW -j DROP' '$UFW_DIR/before.rules'"
+check "geo DROP is NEW-only (tunnel safe)" "grep -q -- '--ctstate NEW -j DROP' '$UFW_DIR/before.rules' && ! grep -qE -- '-A ufw-before-input -j DROP' '$UFW_DIR/before.rules'"
 check "geo enabled conf"                "grep -q 'GEO_ENABLED=1' '$VPSSEC_CONF_DIR/geo.conf'"
 check "geo bypass accepted"             "bash '$HERE/lib/geoip.sh' --bypass add 198.51.100.7 >/dev/null 2>&1 && grep -q 'GEO_BYPASS=.*198.51.100.7' '$VPSSEC_CONF_DIR/geo.conf'"
 check "geo bypass written to rules"     "grep -q -- '-s 198.51.100.7 -j ACCEPT' '$UFW_DIR/before.rules'"
@@ -489,7 +622,7 @@ chmod +x "$STUBS/curl"
 rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --enable > "$SANDBOX/geosafe2.out" 2>&1 || true
 check "geo enable w/ failed downloads refuses" "grep -q 'NOT enabled' '$SANDBOX/geosafe2.out'"
-check "failed downloads write no DROP rule"    "! grep -q -- '-A ufw-before-input -j DROP' '$UFW_DIR/before.rules'"
+check "failed downloads write no DROP rule"    "! grep -q -- 'conntrack --ctstate NEW -j DROP' '$UFW_DIR/before.rules'"
 
 # c) removing the LAST country while enabled -> auto-disable + rules stripped
 cat > "$STUBS/curl" <<'CEOF3'
@@ -504,7 +637,7 @@ printf 'GEO_ENABLED=0\nGEO_COUNTRIES=IR\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.
 printf '1.2.3.0/24\n' > "$VPSSEC_STATE_DIR/geo/IR.cidr"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --enable > /dev/null 2>&1 || true
 check "geo re-enabled for safety test"      "grep -q '^GEO_ENABLED=1$' '$VPSSEC_CONF_DIR/geo.conf'"
-check "geo DROP rule active before remove"  "grep -q -- '-A ufw-before-input -j DROP' '$UFW_DIR/before.rules'"
+check "geo DROP rule active before remove"  "grep -q -- 'conntrack --ctstate NEW -j DROP' '$UFW_DIR/before.rules'"
 rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --remove "ir" > "$SANDBOX/geosafe3.out" 2>&1 || true
 check "last-country remove auto-disables"   "grep -q '^GEO_ENABLED=0$' '$VPSSEC_CONF_DIR/geo.conf'"
@@ -514,7 +647,7 @@ check "last-country remove message shown"   "grep -q 'open to ALL countries' '$S
 # d) boot restore with unsafe config must never re-apply a world-DROP
 printf 'GEO_ENABLED=1\nGEO_COUNTRIES=ZZ\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
 rm -f "$VPSSEC_STATE_DIR/geo/ZZ.cidr"
-{ echo ""; echo "# --- vps-security geoip BEGIN ---"; echo "-A ufw-before-input -j DROP"; echo "# --- vps-security geoip END ---"; } >> "$UFW_DIR/before.rules"
+{ echo ""; echo "# --- vps-security geoip BEGIN ---"; echo "-A ufw-before-input ! -i lo -m conntrack --ctstate NEW -j DROP"; echo "# --- vps-security geoip END ---"; } >> "$UFW_DIR/before.rules"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --ipset-restore > /dev/null 2>&1 || true
 check "boot restore strips unsafe geo rules" "! grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
 # ...and keeps/rewrites them when the config is safe

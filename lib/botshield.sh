@@ -57,23 +57,43 @@ EOF
 
 # Protected ports: explicit list, else the allow-list minus SSH port
 # (SSH is handled separately below with its own limit).
+#
+# TUNNEL PORTS ARE EXCLUDED: `ufw limit` drops a source after ~6 new
+# connections in 30s, and a busy tunnel means one peer IP opening exactly
+# that kind of burst — rate-limiting it would cut the tunnel for the
+# admin's own customers.
 shield_ports() {
     local ports="$1"
+    local sp p out=""
+    sp="$(grep -E '^\s*Port\s+' "${VPSSEC_SSHD_CONFIG:-/etc/ssh/sshd_config}" 2>/dev/null | tail -1 | awk '{print $2}')"
+    [ -z "$sp" ] && sp="22"
     if [ -z "$ports" ]; then
         load_allowed_ports
-        local sp
-        sp="$(grep -E '^\s*Port\s+' "${VPSSEC_SSHD_CONFIG:-/etc/ssh/sshd_config}" 2>/dev/null | tail -1 | awk '{print $2}')"
-        [ -z "$sp" ] && sp="22"
-        local p out=""
         for p in "${ALLOWED_PORTS[@]:-}"; do
             [ -z "$p" ] && continue
             [ "$p" = "$sp" ] && continue
+            port_is_tunnel "$p" && continue
             out+="${out:+,}$p"
         done
-        printf '%s' "$out"
     else
-        printf '%s' "$ports"
+        IFS=',' read -ra want <<< "$ports"
+        for p in "${want[@]:-}"; do
+            [ -z "$p" ] && continue
+            [ "$p" = "$sp" ] && continue
+            port_is_tunnel "$p" && continue
+            out+="${out:+,}$p"
+        done
     fi
+    printf '%s' "$out"
+}
+
+# Is this IP already declared trusted (GeoIP bypass list)?
+ip_is_trusted() {
+    local ip
+    while IFS= read -r ip; do
+        [ "$ip" = "$1" ] && return 0
+    done < <(trusted_ip_list)
+    return 1
 }
 
 # ---------- before.rules TCP-flag drop block ----------
@@ -117,6 +137,7 @@ apply_limit_rules() {
     IFS=',' read -ra plist <<< "$ports_csv"
     for p in "${plist[@]:-}"; do
         [ -z "$p" ] && continue
+        port_is_tunnel "$p" && continue
         cmd_ufw limit "$p"/tcp >/dev/null 2>&1
         cmd_ufw limit "$p"/udp >/dev/null 2>&1
     done
@@ -129,6 +150,7 @@ remove_limit_rules() {
     IFS=',' read -ra plist <<< "$ports_csv"
     for p in "${plist[@]:-}"; do
         [ -z "$p" ] && continue
+        port_is_tunnel "$p" && continue
         cmd_ufw delete limit "$p"/tcp >/dev/null 2>&1
         cmd_ufw delete limit "$p"/udp >/dev/null 2>&1
     done
@@ -145,6 +167,14 @@ ban_ip() {
     local ip="$1" hits="$2"
     ensure_dirs
     grep -qF "|$ip" "$BANS_FILE" 2>/dev/null && return 0
+    # SAFETY on tunnelled servers: never ban the machine's own addresses
+    # (that is the tunnel talking to itself) or a peer the admin declared
+    # trusted — banning either one takes the tunnel down.
+    if ip_is_local "$ip" || ip_is_trusted "$ip"; then
+        printf '%s SKIP-BAN %s (local/trusted peer)\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$ip" >> "$SHIELD_LOG"
+        return 0
+    fi
     cmd_ufw deny from "$ip" >/dev/null 2>&1 || true
     printf '%s|%s\n' "$(date +%s)" "$ip" >> "$BANS_FILE"
     printf '%s BAN %s (hits=%s, expires in %ss)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$ip" "$hits" "$BAN_SECONDS" >> "$BAN_LOG"
@@ -177,6 +207,26 @@ ip_hits() {
     [ -f "$VPSSEC_STATE_DIR/shield-hits.log" ] && grep -cF "|$ip" "$VPSSEC_STATE_DIR/shield-hits.log" 2>/dev/null || echo 0
 }
 
+# Print "<local> <peer>" for every half-open (SYN-RECV) connection.
+#
+# NOTE: `ss -tan` prints no Netid column while `ss -tunap` does, so the
+# column positions differ. This used to read $1/$2 as "tcp"/"SYN-RECV"
+# (the -tunap layout) while reading $4/$5 as local/peer (the -tan layout),
+# which meant the auto-ban never matched a single connection. Both layouts
+# are accepted here.
+ss_syn_recv() {
+    ss -tan 2>/dev/null | awk '
+        NR == 1 && ($1 == "State" || $1 == "Netid") { next }
+        {
+            if ($1 == "tcp" || $1 == "tcp6" || $1 == "udp" || $1 == "udp6") {
+                st = $2; l = $5; r = $6
+            } else {
+                st = $1; l = $4; r = $5
+            }
+            if (st == "SYN-RECV") print l " " r
+        }'
+}
+
 # Inspect recent connections (ss) and ban IPs with too many NEW
 # connections to protected ports.
 scan_and_ban() {
@@ -184,30 +234,33 @@ scan_and_ban() {
     # zombie guard: never scan/ban while the shield is disabled
     shield_is_enabled || return 0
     load_shield_conf
+    load_tunnel_ports
     local ports_csv
     ports_csv="$(shield_ports "$SHIELD_PORTS")"
     [ -z "$ports_csv" ] && return 0
 
-    # Local ports of SYN-RECV connections = someone hammering new conns
-    local syn_ports
-    syn_ports="$(ss -tan 2>/dev/null | awk 'NR>1 && $1=="tcp" && $2=="SYN-RECV" {print $4}' \
+    local pairs
+    pairs="$(ss_syn_recv)"
+    [ -z "$pairs" ] && return 0
+
+    local syn_ports sp_port ip
+    syn_ports="$(printf '%s\n' "$pairs" | awk '{print $1}' \
         | sed -E 's/.*[:.]([0-9]+)$/\1/' | sort -u || true)"
     [ -z "$syn_ports" ] && return 0
 
-    local sp_port
     for sp_port in $syn_ports; do
         case ",$ports_csv," in
             *",$sp_port,"*) ;;
             *) continue ;;
         esac
-        # offending peer IPs on that port
-        local ip
-        for ip in $(ss -tan 2>/dev/null | awk -v P=":$sp_port" 'NR>1 && $1=="tcp" && $2=="SYN-RECV" && $4 ~ P {print $5}' \
-            | sed -E 's/^\[?([0-9a-fA-F:.]+)\]?:[0-9]+$/\1/' | sort | uniq -c | awk -v T="$BAN_THRESHOLD" '$1 >= T {print $2}'); do
-            case "$ip" in
-                127.0.0.1|::1) continue ;;
-            esac
-            ban_ip "$ip" "$(ss -tan 2>/dev/null | awk -v P=":$sp_port" -v IP="$ip" 'NR>1 && $1=="tcp" && $2=="SYN-RECV" && $4 ~ P && $5 ~ IP' | wc -l)"
+        # offending peer IPs on that port (ban_ip itself refuses
+        # loopback/private/trusted peers)
+        for ip in $(printf '%s\n' "$pairs" \
+            | awk -v P=":$sp_port" '$1 ~ P {print $2}' \
+            | sed -E 's/^\[?([0-9a-fA-F:.]+)\]?:[0-9]+$/\1/' | sort | uniq -c \
+            | awk -v T="$BAN_THRESHOLD" '$1 >= T {print $2}'); do
+            ban_ip "$ip" "$(printf '%s\n' "$pairs" \
+                | awk -v P=":$sp_port" -v IP="$ip" '$1 ~ P && $2 ~ IP' | wc -l)"
         done
     done
     return 0
@@ -218,6 +271,7 @@ scan_and_ban() {
 shield_enable() {
     load_shield_conf
     ensure_dirs
+    load_tunnel_ports
     local ports_csv="${1:-}"
     SHIELD_PORTS="$(shield_ports "$ports_csv")"
     SHIELD_ENABLED=1
@@ -229,7 +283,7 @@ shield_enable() {
 
     apply_limit_rules "$SHIELD_PORTS" "$sp"
     write_flag_drops
-    if have_iptables && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -q active; then
+    if have_iptables && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -qx 'Status: active'; then
         ufw reload >/dev/null 2>&1 || true
     fi
 
@@ -282,7 +336,7 @@ shield_disable() {
     fi
     remove_limit_rules "$SHIELD_PORTS" "$sp"
     remove_flag_drops
-    if have_iptables && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -q active; then
+    if have_iptables && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -qx 'Status: active'; then
         ufw reload >/dev/null 2>&1 || true
     fi
     cmd_systemctl disable --now vps-security-shield.timer 2>/dev/null || true

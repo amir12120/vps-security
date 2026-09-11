@@ -10,6 +10,8 @@
 #   install      First-time setup (update, SSH port, firewall, monitor)
 #   status       Show firewall, SSH and monitor status
 #   ports        Add / remove allowed ports
+#   tunnels      Tunnel / proxy ports (add / remove / list) — never blocked,
+#                never rate-limited: use this for reverse/direct tunnels
 #   port         Change the SSH port
 #   scan         Run a rogue-port scan right now
 #   blocked      View blocked ports
@@ -65,7 +67,7 @@ fi
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.3.4"
+VERSION="1.3.5"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
 REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
 REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"
@@ -206,6 +208,110 @@ read_confirm() {
     case "$a" in
         [Yy]|[Yy][Ee][Ss]) return 0 ;;
         *) return 1 ;;
+    esac
+}
+
+# ------------------------------------------------------------
+# Firewall / listening state helpers (tunnel-aware)
+# ------------------------------------------------------------
+
+# Non-loopback ports ufw already allows — the admin's own rules, which
+# must survive a reinstall (tunnel ports, panels, game servers, ...).
+ufw_existing_ports() {
+    command -v ufw >/dev/null 2>&1 || return 0
+    ufw status 2>/dev/null | awk '
+        $2 == "ALLOW" {
+            p = $1
+            sub(/\/(tcp|udp)$/, "", p)
+            if (p ~ /^[0-9]+$/) print p
+        }
+    ' | sort -u || true
+}
+
+# Ports listening on a non-loopback address right now, space separated.
+listening_ports_now() {
+    command -v ss >/dev/null 2>&1 || return 0
+    ss -tulnH 2>/dev/null | awk '
+        function is_loopback(a) {
+            return (a ~ /^127\./ || a ~ /^\[::1\]/ || a ~ /^::1:/ || a ~ /^\[::ffff:127\./)
+        }
+        ($2 == "LISTEN" || $2 == "UNCONN") {
+            port = $5
+            sub(/.*[:.]/, "", port)
+            if (port ~ /^[0-9]+$/ && !is_loopback($5)) print port
+        }
+    ' | sort -un | tr '\n' ' ' || true
+}
+
+# Add one or more tunnel ports (and open them in ufw).
+tunnel_ports_add() {
+    local input="$1" tp added=0
+    need_root
+    ensure_dirs
+    IFS=',' read -ra want <<< "$input"
+    for tp in "${want[@]:-}"; do
+        tp="$(printf '%s' "$tp" | tr -d '[:space:]')"
+        [ -z "$tp" ] && continue
+        if ! is_valid_port "$tp"; then
+            warn "Ignoring invalid port: $tp"
+            continue
+        fi
+        if grep -qx "$tp" "$TUNNEL_PORTS_CONF" 2>/dev/null; then
+            info "Port $tp is already a tunnel port."
+        else
+            echo "$tp" >> "$TUNNEL_PORTS_CONF"
+            added=$((added + 1))
+        fi
+        # A tunnel port has to be reachable to be useful.
+        grep -qx "$tp" "$ALLOWED_PORTS_CONF" 2>/dev/null || echo "$tp" >> "$ALLOWED_PORTS_CONF"
+        if command -v ufw >/dev/null 2>&1; then
+            ufw allow "$tp"/tcp >/dev/null 2>&1 || true
+            ufw allow "$tp"/udp >/dev/null 2>&1 || true
+        fi
+    done
+    load_tunnel_ports
+    if [ "$added" -gt 0 ]; then
+        ok "Tunnel ports now: ${TUNNEL_PORTS[*]}"
+        info "The monitor will never block them and the shield never rate-limits them."
+    fi
+    return 0
+}
+
+# Remove a port from the tunnel list (the firewall rule is left alone —
+# use the Ports menu if you also want it closed).
+tunnel_ports_remove() {
+    local tp
+    need_root
+    for tp in "$@"; do
+        tp="$(printf '%s' "$tp" | tr -d '[:space:]')"
+        is_valid_port "$tp" || continue
+        [ -f "$TUNNEL_PORTS_CONF" ] && sed -i "/^${tp}\$/d" "$TUNNEL_PORTS_CONF"
+        ok "Port $tp is no longer declared as a tunnel port."
+    done
+    load_tunnel_ports
+    return 0
+}
+
+show_tunnel_ports() {
+    ensure_dirs
+    load_tunnel_ports
+    echo "=== tunnel / proxy ports ==="
+    if [ "${#TUNNEL_PORTS[@]}" -eq 0 ]; then
+        echo "  (none declared)"
+        echo "  Declared ports are never blocked by the monitor and never"
+        echo "  rate-limited by the Bot & Scanner Shield."
+    else
+        local p
+        for p in "${TUNNEL_PORTS[@]}"; do echo "  - $p"; done
+    fi
+    return 0
+}
+
+cmd_tunnels() {
+    case "${1:-list}" in
+        add)    shift; tunnel_ports_add "${1:-}" ;;
+        remove) shift; tunnel_ports_remove "$@" ;;
+        list|*) show_tunnel_ports ;;
     esac
 }
 
@@ -365,6 +471,29 @@ _install_guided() {
         info "Existing allowed ports: $(tr '\n' ' ' < "$ALLOWED_PORTS_CONF")"
     fi
 
+    # ----------------------------------------------------------------
+    # TUNNEL SAFETY — adopt whatever the admin already has open.
+    # Step 3 resets ufw, which would otherwise cut off a working tunnel,
+    # panel or proxy port that was opened before vps-security existed.
+    # ----------------------------------------------------------------
+    local adopted
+    adopted="$(ufw_existing_ports)"
+    if [ -n "$adopted" ]; then
+        info "Ports already open in ufw (keeping them): $(echo "$adopted" | tr '\n' ' ')"
+        while IFS= read -r p || [ -n "$p" ]; do
+            [ -z "$p" ] && continue
+            grep -qx "$p" "$ALLOWED_PORTS_CONF" 2>/dev/null || echo "$p" >> "$ALLOWED_PORTS_CONF"
+        done <<< "$adopted"
+    fi
+
+    # Show what is listening so a tunnel/panel port is never missed.
+    local listening
+    listening="$(listening_ports_now)"
+    if [ -n "$listening" ]; then
+        info "Services listening right now: $listening"
+        info "If any of these is a tunnel, VPN or panel port, keep it open below."
+    fi
+
     info "Enter the ports to keep open, one per line. Empty line = finish."
     info "SSH port $current_port is added automatically."
     grep -qx "$current_port" "$ALLOWED_PORTS_CONF" || echo "$current_port" >> "$ALLOWED_PORTS_CONF"
@@ -385,6 +514,35 @@ _install_guided() {
         echo "$p" >> "$ALLOWED_PORTS_CONF"
         ok "  $p added."
     done
+
+    # ----------------------------------------------------------------
+    # Tunnel / proxy ports: opened in the firewall like any allowed port,
+    # but the monitor never flags them as rogue and the shield never
+    # rate-limits them — a busy tunnel is one peer IP opening exactly the
+    # connection burst that `ufw limit` treats as an attack.
+    # ----------------------------------------------------------------
+    info "Tunnels: ports you declare here are opened and left alone."
+    if read_confirm "Declare tunnel / VPN / proxy ports now? [y/N] " "n"; then
+        prompt "  Tunnel ports (comma-separated, blank = none): "
+        read -r tp_in
+        local tp
+        IFS=',' read -ra tp_list <<< "$tp_in"
+        for tp in "${tp_list[@]:-}"; do
+            tp="$(printf '%s' "$tp" | tr -d '[:space:]')"
+            [ -z "$tp" ] && continue
+            if ! is_valid_port "$tp"; then
+                warn "Ignoring invalid port: $tp"
+                continue
+            fi
+            ensure_dirs
+            grep -qx "$tp" "$TUNNEL_PORTS_CONF" 2>/dev/null || echo "$tp" >> "$TUNNEL_PORTS_CONF"
+            # a tunnel port must also be open, otherwise it cannot work
+            grep -qx "$tp" "$ALLOWED_PORTS_CONF" 2>/dev/null || echo "$tp" >> "$ALLOWED_PORTS_CONF"
+        done
+        [ -s "$TUNNEL_PORTS_CONF" ] && ok "Tunnel ports: $(tr '\n' ' ' < "$TUNNEL_PORTS_CONF")"
+    else
+        info "None declared — add them later: Ports menu → Tunnel ports."
+    fi
 
     # SAFETY: if the user added NO ports of their own (list = just SSH),
     # do not enable a restrictive firewall at all — leave the system open
@@ -410,6 +568,8 @@ _install_guided() {
 
     info "Installing ufw..."
     apt-get install -y ufw >/dev/null 2>&1 || true
+    # Every adopted port is already in the allow-list above and is re-opened
+    # right after this reset — nothing the admin had is lost.
     ufw --force reset >/dev/null 2>&1 || true
     while IFS= read -r p || [ -n "$p" ]; do
         p="${p%%#*}"; p="$(printf '%s' "$p" | tr -d '[:space:]')"
@@ -595,6 +755,14 @@ cmd_status() {
         printf "  ${YELLOW}●${RESET} Rogue monitor   : not installed\n"
     fi
 
+    # Tunnel ports (never blocked / never rate-limited)
+    load_tunnel_ports
+    if [ "${#TUNNEL_PORTS[@]}" -gt 0 ]; then
+        printf "  ${GREEN}●${RESET} Tunnel ports    : %s\n" "${TUNNEL_PORTS[*]}"
+    else
+        printf "  ${DIM}●${RESET} Tunnel ports    : none declared (use 'vpssec tunnels add <port>')\n"
+    fi
+
     # Maintenance
     if [ -f "$VPSSEC_SYSTEMD_DIR/vps-security-maint.timer" ]; then
         printf "  ${GREEN}●${RESET} Maintenance     : installed (RAM cache + log cleanup, every 2 days)\n"
@@ -717,7 +885,8 @@ action_ports_menu() {
         ui_menu "Ports — Manage Allowed Ports" \
             "➕ Add an allowed port (open)" \
             "➖ Remove an allowed port (close)" \
-            "📋 Show allowed ports list"
+            "📋 Show allowed ports list" \
+            "🚇 Tunnel ports (never blocked / never rate-limited)" 
         local c="$MENU_IDX"
         case "$c" in
             1) action_port_add; ui_press_any_key ;;
@@ -732,7 +901,46 @@ action_ports_menu() {
                    done < <(list_ports_raw)
                fi
                ui_press_any_key ;;
+            4) action_tunnel_menu ;;
             0) return 0 ;;
+        esac
+    done
+}
+
+action_tunnel_menu() {
+    while :; do
+        ui_menu "Tunnel ports — declared ports are left alone" \
+            "📋 Show declared tunnel ports" \
+            "➕ Declare a tunnel / VPN / proxy port" \
+            "➖ Undeclare a tunnel port" \
+            "🚪 Back"
+        case "$MENU_IDX" in
+            1)
+                ui_title "Tunnel Ports"
+                show_tunnel_ports
+                ui_press_any_key ;;
+            2)
+                ui_title "Declare a Tunnel Port"
+                info "Opened in the firewall, never flagged as rogue,"
+                info "never rate-limited by the shield."
+                local listening
+                listening="$(listening_ports_now)"
+                [ -n "$listening" ] && info "Listening right now: $listening"
+                prompt "Port(s) to declare (comma-separated): "
+                read -r tp_in
+                [ -z "$tp_in" ] && { info "Cancelled."; ui_press_any_key; continue; }
+                tunnel_ports_add "$tp_in"
+                ui_press_any_key ;;
+            3)
+                ui_title "Undeclare a Tunnel Port"
+                show_tunnel_ports
+                prompt "Port(s) to remove (comma-separated): "
+                read -r tp_in
+                [ -z "$tp_in" ] && { info "Cancelled."; ui_press_any_key; continue; }
+                IFS=',' read -ra tp_list <<< "$tp_in"
+                tunnel_ports_remove "${tp_list[@]}"
+                ui_press_any_key ;;
+            0|4) return 0 ;;
         esac
     done
 }
@@ -1009,6 +1217,8 @@ Commands:
   install      First-time setup (update, SSH port, firewall, monitor)
   status       Show firewall, SSH and monitor status
   ports        Add / remove allowed ports
+  tunnels      Tunnel / proxy ports (add / remove / list) — never blocked,
+               never rate-limited: use this for reverse/direct tunnels
   port         Change the SSH port
   scan         Run a rogue-port scan right now
   blocked      View blocked ports
@@ -1021,6 +1231,11 @@ Commands:
   logs         Show monitor log
   uninstall    Remove vps-security completely
   help         Show this help
+
+Tunnelled servers: declare every tunnel / VPN / proxy port with
+'sudo vpssec tunnels add <port>' so the monitor and the shield leave it
+alone. The GeoIP filter only drops NEW inbound connections, so outbound
+tunnels keep working from any country.
 
 Every command is also available from the menu. The TUI uses arrow keys;
 over a plain pipe it falls back to a numbered menu automatically.
@@ -1355,6 +1570,7 @@ case "${1:-}" in
     install)   shift; cmd_install "$@" ;;
     status)    cmd_status ;;
     ports)     cmd_ports ;;
+    tunnels)   shift; cmd_tunnels "$@" ;;
     port)      cmd_port ;;
     scan)      need_root; action_scan ;;
     blocked)   cmd_blocked ;;

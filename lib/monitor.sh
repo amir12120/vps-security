@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # ============================================================
 # vps-security — rogue-port monitor
-#
-# Every run (systemd timer fires every 30 minutes):
+## Every run (systemd timer fires every 30 minutes):
 #   1. Unblock any ports whose 1-hour block has expired.
-#   2. Scan live TCP/UDP connections (ss -tunap).
-#   3. Any LOCAL port that is actively transferring data (has at
-#      least one established/active connection) and is NOT in the
-#      user-approved allow-list gets BLOCKED via ufw for one hour.
-#   4. Approved ports, the monitor's own connections, and already
-#      blocked ports are skipped.
+#   2. Scan live sockets (ss -tunap).
+#   3. Any port BOUND on a public address that is actively serving
+#      traffic and is NOT approved gets BLOCKED via ufw for one hour:
+#        - TCP: a LISTEN socket that also has established connections
+#        - UDP: a bound socket outside the ephemeral port range
+#   4. Skipped: allow-listed ports, declared tunnel ports, the sshd and
+#      guard ports, already-blocked ports, loopback-only sockets, and
+#      anything the admin has already allowed in ufw.
+#
+# Outbound sockets are deliberately NOT candidates: their local port is
+# a kernel-assigned ephemeral port. On a tunnelled server (the normal
+# case) blocking those would break the tunnel and spam ufw with rules.
+#
 #
 # blocked-ports.list lines have the form:  <unix-ts>|<port>
 # ============================================================
@@ -25,19 +31,60 @@ have_ss()  { command -v ss >/dev/null 2>&1; }
 have_ufw() { command -v ufw >/dev/null 2>&1; }
 ss_raw()   { ss -tunap 2>/dev/null || true; }
 
-# Extract the local ports of all ACTIVE connections (established TCP
-# or connected UDP sockets).
+# Ports that are BOUND on a non-loopback address, as "proto|port".
+#
+# Only bound sockets can be services. The local ports of outbound
+# connections are kernel-assigned ephemeral ports, and this server very
+# likely opens such connections all the time — a tunnel to a foreign
+# server, a panel API call, package updates. Blocking those (which the
+# old implementation did) breaks tunnels and fills ufw with junk rules.
 # ss -tunap fields: $1=netid $2=state $3=recvq $4=sendq $5=local $6=peer
-active_local_ports() {
+bound_local_ports() {
+    have_ss || return 0
+    ss_raw | awk '
+        function is_loopback(a) {
+            return (a ~ /^127\./ || a ~ /^\[::1\]/ || a ~ /^::1:/ || a ~ /^\[::ffff:127\./)
+        }
+        NR > 1 {
+            port = $5
+            sub(/.*[:.]/, "", port)
+            if (port !~ /^[0-9]+$/) next
+            if ($1 == "tcp") {
+                if ($2 == "LISTEN" && !is_loopback($5)) print "tcp|" port
+            } else if ($1 == "udp") {
+                # a bound UDP socket is a service; connected ones are clients
+                if ($2 == "UNCONN" && !is_loopback($5)) print "udp|" port
+            }
+        }
+    ' | sort -u || true
+}
+
+# Local ports of established TCP connections — proof that a bound port is
+# actually serving traffic right now.
+serving_local_ports() {
     have_ss || return 0
     ss_raw | awk '
         NR > 1 {
-            if ($1 == "tcp" && $2 != "LISTEN") print $5;
-            else if ($1 == "udp" && $2 == "ESTAB") print $5;
+            if ($1 != "tcp" || $2 != "ESTAB") next
+            port = $5
+            sub(/.*[:.]/, "", port)
+            if (port ~ /^[0-9]+$/) print port
         }
-    ' \
-    | sed -E 's/^\[?([0-9a-fA-F:.]+)?\]?[:.]([0-9]+)$/\2/' \
-    | grep -E '^[0-9]+$' || true
+    ' | sort -u || true
+}
+
+# Ports the administrator already opened in ufw. A port that is allowed
+# at the firewall is approval in itself — the monitor must never fight a
+# rule the admin set for their own tunnel.
+ufw_allowed_ports() {
+    have_ufw || return 0
+    ufw status 2>/dev/null | awk '
+        $2 == "ALLOW" {
+            p = $1
+            sub(/\/(tcp|udp)$/, "", p)
+            if (p ~ /^[0-9]+$/) print p
+        }
+    ' | sort -u || true
 }
 
 # Remove expired blocks (older than BLOCK_SECONDS)
@@ -96,30 +143,64 @@ block_port() {
         "$(date '+%Y-%m-%d %H:%M:%S')" "$port" "$reason" "$BLOCK_SECONDS" >> "$MONITOR_LOG"
 }
 
+# Is this a UDP port that can only belong to a CLIENT socket?
+# Ephemeral ports are handed out to outbound sockets, and a few
+# protocols (DHCP/NTP) legitimately bind system-wide.
+udp_is_client_port() {
+    local port="$1" lo p
+    lo="$(local_port_range_lo)"
+    [ "$port" -ge "$lo" ] && return 0
+    for p in $UDP_CLIENT_PORTS; do
+        [ "$port" = "$p" ] && return 0
+    done
+    return 1
+}
+
 # Main scan
 run_scan() {
     ensure_dirs
     load_allowed_ports
+    load_tunnel_ports
 
-    printf '%s scan start (allowed: %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
-        "${ALLOWED_PORTS[*]:-none}" >> "$MONITOR_LOG"
+    printf '%s scan start (allowed: %s; tunnel: %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "${ALLOWED_PORTS[*]:-none}" "${TUNNEL_PORTS[*]:-none}" >> "$MONITOR_LOG"
 
     unblock_expired
 
-    local ports found=0 blocked=0
-    ports="$(active_local_ports)"
-    [ -z "$ports" ] && return 0
+    local bound serving ufw_open proto port found=0 blocked=0
+    bound="$(bound_local_ports)"
+    [ -z "$bound" ] && return 0
+    serving="$(serving_local_ports)"
+    ufw_open="$(ufw_allowed_ports)"
 
-    while IFS= read -r port; do
+    while IFS='|' read -r proto port; do
         [ -z "$port" ] && continue
         found=$((found + 1))
+        # The admin's own declarations always win.
         port_is_allowed "$port" && continue
+        port_is_tunnel "$port" && {
+            printf '%s SKIP %s (declared tunnel port)\n' \
+                "$(date '+%Y-%m-%d %H:%M:%S')" "$port" >> "$MONITOR_LOG"
+            continue
+        }
         port_is_blocked "$port" && continue
-        block_port "$port" "rogue traffic detected"
+        # A port the admin already opened in ufw is approved by definition.
+        if [ -n "$ufw_open" ] && printf '%s\n' "$ufw_open" | grep -qx "$port"; then
+            continue
+        fi
+        if [ "$proto" = "tcp" ]; then
+            # Only block a service that is demonstrably serving traffic.
+            printf '%s\n' "$serving" | grep -qx "$port" || continue
+        else
+            # UDP has no per-socket activity counter: trust only ports
+            # outside the ephemeral range and never block client sockets.
+            udp_is_client_port "$port" && continue
+        fi
+        block_port "$port" "rogue $proto service carrying traffic"
         blocked=$((blocked + 1))
-    done <<< "$ports"
+    done <<< "$bound"
 
-    printf '%s scan done: %d active local port(s) seen, %d newly blocked\n' \
+    printf '%s scan done: %d bound port(s) seen, %d newly blocked\n' \
         "$(date '+%Y-%m-%d %H:%M:%S')" "$found" "$blocked" >> "$MONITOR_LOG"
     return 0
 }

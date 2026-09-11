@@ -49,6 +49,13 @@ MONITOR_CONF="$VPSSEC_CONF_DIR/monitor.conf"  # shellcheck disable=SC2034
 ALLOWED_PORTS_CONF="$VPSSEC_CONF_DIR/allowed-ports.list"
 BLOCK_LIST_FILE="$VPSSEC_STATE_DIR/blocked-ports.list"
 BLOCK_LOG="$VPSSEC_STATE_DIR/port-blocks.log"
+# Ports that carry tunnels / reverse proxies. They are ordinary allowed
+# ports for the firewall, but the monitor never flags them as rogue and
+# the shield never rate-limits them: a busy tunnel peer is one IP opening
+# many connections, which looks exactly like an attack to `ufw limit`.
+TUNNEL_PORTS_CONF="$VPSSEC_CONF_DIR/tunnel-ports.list"
+# Client-side protocols that legitimately bind UDP sockets system-wide.
+UDP_CLIENT_PORTS="67 68 123 546 547"
 
 ensure_dirs() {
     mkdir -p "$VPSSEC_CONF_DIR" "$VPSSEC_STATE_DIR"
@@ -80,6 +87,67 @@ port_is_allowed() {
         [ "$p" = "$1" ] && return 0
     done
     return 1
+}
+
+# Read tunnel/proxy ports (comments and blanks ignored). Populates TUNNEL_PORTS.
+load_tunnel_ports() {
+    TUNNEL_PORTS=()
+    [ -f "$TUNNEL_PORTS_CONF" ] || return 0
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        line="$(printf '%s' "$line" | tr -d '[:space:]')"
+        [ -z "$line" ] && continue
+        is_valid_port "$line" && TUNNEL_PORTS+=("$line")
+    done < "$TUNNEL_PORTS_CONF"
+    return 0
+}
+
+# Is this port declared as a tunnel / reverse-proxy port?
+port_is_tunnel() {
+    local p
+    for p in "${TUNNEL_PORTS[@]:-}"; do
+        [ "$p" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# The local port range the kernel hands out to OUTBOUND sockets.
+# Outbound client sockets (DNS queries, tunnel connections to a remote
+# server) live here, so the monitor must never treat them as services.
+local_port_range_lo() {
+    local lo=""
+    [ -r /proc/sys/net/ipv4/ip_local_port_range ] && \
+        read -r lo _ < /proc/sys/net/ipv4/ip_local_port_range
+    is_valid_port "${lo:-}" && { printf '%s' "$lo"; return 0; }
+    printf '32768'
+}
+
+# Is this address inside the server's own private/loopback space?
+# Such "peers" are the machine talking to itself or to its LAN — never a
+# remote attacker, and on a tunnelled server they are the tunnel itself.
+# Nothing in this toolkit may ever ban or block them.
+ip_is_local() {
+    case "${1:-}" in
+        ''|127.*|::1|0.0.0.0|::)                     return 0 ;;
+        10.*|192.168.*|169.254.*)                    return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*)       return 0 ;;
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[0-2][0-9].*) return 0 ;;
+        fe80:*|fc??:*|fd??:*|::ffff:127.*)           return 0 ;;
+    esac
+    return 1
+}
+
+# Trusted peers that must never be banned (read from the GeoIP bypass
+# list, which is the toolkit's single "never block this IP" declaration).
+trusted_ip_list() {
+    local ip
+    [ -f "$VPSSEC_CONF_DIR/geo.conf" ] || return 0
+    while IFS= read -r ip; do
+        [ -n "$ip" ] && printf '%s\n' "$ip"
+    done < <(grep -m1 '^GEO_BYPASS=' "$VPSSEC_CONF_DIR/geo.conf" 2>/dev/null \
+        | cut -d= -f2- | tr ',' '\n')
+    return 0
 }
 
 # Is a port currently blocked by the guard? (list lines: <unix-ts>|<port>)
