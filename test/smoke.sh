@@ -330,7 +330,7 @@ LINK_DIR="$SANDBOX/bin"
 mkdir -p "$LINK_DIR"
 if ln -s "$HERE/vpssec" "$LINK_DIR/vpssec" 2>/dev/null && [ -L "$LINK_DIR/vpssec" ]; then
     printf '0\n' | bash "$LINK_DIR/vpssec" > "$SANDBOX/linkmenu.out" 2>&1 || true
-    bash "$LINK_DIR/vpssec" version | grep -q 'vpssec 1.3.3' && R=0 || R=1
+    bash "$LINK_DIR/vpssec" version | grep -q 'vpssec 1.3.4' && R=0 || R=1
     check "symlinked CLI loads its libraries"  "[ \"$R\" -eq 0 ]"
     check "symlinked CLI draws the menu"       "grep -q 'Main Menu' '$SANDBOX/linkmenu.out'"
     check "symlinked CLI reports no load error" "! grep -q 'unbound variable\|No such file' '$SANDBOX/linkmenu.out'"
@@ -359,7 +359,7 @@ fi
 
 echo
 echo "=== smoke: help & version ==="
-bash "$HERE/vpssec" version | grep -q 'vpssec 1.3.3' && R=0 || R=1
+bash "$HERE/vpssec" version | grep -q 'vpssec 1.3.4' && R=0 || R=1
 check "version reports 1.3.3"           "[ \"$R\" -eq 0 ]"
 bash "$HERE/vpssec" help | grep -q 'update' && R=0 || R=1
 check "help mentions update"            "[ \"$R\" -eq 0 ]"
@@ -436,12 +436,12 @@ echo
 echo "=== smoke: GeoIP country names (full names / Persian / alpha-3) ==="
 # a) add via full names, Persian names, alpha-3 and unique prefix
 printf 'GEO_ENABLED=0\nGEO_COUNTRIES=\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
-UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --add "Iran,Germany,USA,آلمان,united kingdom,Turk" > "$SANDBOX/geonames.out" 2>&1 || true
-check "names resolve (EN/FA/a3/prefix)" "grep -q 'GEO_COUNTRIES=IR,DE,US,GB,TR' '$VPSSEC_CONF_DIR/geo.conf'"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --add "Iran,Germany,USA,آلمان,united kingdom,Swed" > "$SANDBOX/geonames.out" 2>&1 || true
+check "names resolve (EN/FA/a3/prefix)" "grep -q 'GEO_COUNTRIES=IR,DE,US,GB,SE' '$VPSSEC_CONF_DIR/geo.conf'"
 check "ambiguous prefix rejected"       "grep -q '\"united\" is not a valid\|not a valid country' '$SANDBOX/geonames.out' && ! grep -q 'GEO_COUNTRIES=.*GB,\|,GB$' /dev/null; grep -c 'united' '$VPSSEC_CONF_DIR/geo.conf' | grep -q '^0$'"
-# b) remove via full + Persian names (list is IR,DE,US,GB,TR after a)
+# b) remove via full + Persian names (list is IR,DE,US,GB,SE after a)
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --remove "united kingdom,ایران" > /dev/null 2>&1 || true
-check "remove by name works"            "grep -q '^GEO_COUNTRIES=DE,US,TR$' '$VPSSEC_CONF_DIR/geo.conf'"
+check "remove by name works"            "grep -q '^GEO_COUNTRIES=DE,US,SE$' '$VPSSEC_CONF_DIR/geo.conf'"
 # c) bogus name is rejected and adds nothing
 printf 'GEO_ENABLED=0\nGEO_COUNTRIES=\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --add "Atlantis,Narnia" > "$SANDBOX/geobogus.out" 2>&1 || true
@@ -449,6 +449,24 @@ check "bogus names rejected"            "grep -q 'not a valid country' '$SANDBOX
 # d) CLI prompt mentions full names
 bash "$HERE/vpssec" help > /dev/null 2>&1 || true
 check "geo help still lists commands"   "bash '$HERE/vpssec' help 2>&1 | grep -q 'geo'"
+
+# e) forgiving spellings: exact name, short form, typo, alpha-3, alias
+printf 'GEO_ENABLED=0\nGEO_COUNTRIES=\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --add "netherlands,netherland,nederlands,NLD,IRN,deutschland" > "$SANDBOX/geofuzzy.out" 2>&1 || true
+check "every forgiving spelling resolved"   "! grep -q 'not a valid' '$SANDBOX/geofuzzy.out'"
+check "they all land on NL, IR, DE"         "grep -q '^GEO_COUNTRIES=NL,IR,DE$' '$VPSSEC_CONF_DIR/geo.conf'"
+
+# f) an ambiguous name gets a usable hint instead of silence
+printf 'GEO_ENABLED=0\nGEO_COUNTRIES=\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --add "Turk" > "$SANDBOX/geohint.out" 2>&1 || true
+check "ambiguous name lists candidates"  "grep -q 'Did you mean:.*TR (turkey)' '$SANDBOX/geohint.out' && grep -q 'TM (turkmenistan)' '$SANDBOX/geohint.out'"
+check "ambiguity never applies a guess"  "grep -q '^GEO_COUNTRIES=$' '$VPSSEC_CONF_DIR/geo.conf'"
+
+# g) name lookup table (vpssec geo names / geoip.sh --names)
+bash "$HERE/lib/geoip.sh" --names > "$SANDBOX/geonametable.out" 2>&1 || true
+check "names table lists countries"      "grep -q 'netherlands' '$SANDBOX/geonametable.out' && grep -q 'germany' '$SANDBOX/geonametable.out'"
+check "names table shows Persian aliases" "grep -q 'هلند' '$SANDBOX/geonametable.out'"
+check "names table mentions NL code"     "grep -qE '^  NL ' '$SANDBOX/geonametable.out'"
 
 echo
 echo "=== smoke: GeoIP safety — server must stay open when no countries are set ==="

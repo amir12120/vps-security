@@ -31,7 +31,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.3.3 — server hardening toolkit
+  vps-security v1.3.4 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────
@@ -120,13 +120,21 @@ Enable it from the **🛡️ Bot & Scanner Shield** menu (or `vpssec shield enab
 
 From the **🌍 GeoIP country filter** menu (or `vpssec geo ...`):
 
-1. **➕ Add allowed countries** — enter any number of countries: 2-letter codes (`IR,DE,TR,US`), **full names** (`Iran,Germany,Turkey`), Persian names (`ایران,آلمان,ترکیه`), ISO alpha-3 (`USA`), or unique name prefixes — the list is unlimited. Invalid or ambiguous entries are rejected with a clear warning.
+1. **➕ Add allowed countries** — enter any number of countries, however you happen to spell them — the list is unlimited. **120+ countries** are built in, and matching is forgiving:
+   - 2-letter codes: `IR,DE,TR,US`
+   - **full names**: `Iran,Germany,Netherlands,Turkey`
+   - **Persian names**: `ایران,آلمان,هلند,ترکیه`
+   - ISO alpha-3, any case: `USA,IRN,deu`
+   - **aliases**: `holland`, `deutschland`, `england`, `dubai`, `america`, `korea`
+   - short forms and obvious typos: `netherland`, `nederlands`, `germny`, `qater` all resolve
+   - Unknown or **ambiguous** entries change nothing and print a hint: `'Turk' is not a valid country code or name … Did you mean: TR (turkey), TM (turkmenistan) ?`
+   - Not sure of a code? **📖 Country codes & names** in the menu (or `vpssec geo names`) prints the whole code/name/alias table.
 2. **✅ Enable filtering** — downloads each country's IPv4 CIDR list (IPFire location database, updated daily), loads them into an **ipset**, and wires ufw so that *only* those countries can reach the server — everyone else is dropped
 3. **🛟 Bypass** — add your own IP so it is never geo-blocked, even from a blocked country (the menu shows your current public IP)
 4. **♻️ Refresh** — country lists refresh automatically every week; refresh manually any time
 5. **⛔ Disable** — removes all geo rules instantly; everyone can connect again
 
-Direct commands: `vpssec geo add IR,DE` (codes, full names, or Persian names) · `vpssec geo remove TR` · `vpssec geo list` · `vpssec geo enable|disable` · `vpssec geo bypass <ip>` · `vpssec geo refresh`
+Direct commands: `vpssec geo add IR,DE` (codes, full names, or Persian names) · `vpssec geo remove TR` · `vpssec geo names` (lookup table) · `vpssec geo list` · `vpssec geo enable|disable` · `vpssec geo bypass <ip>` · `vpssec geo refresh`
 
 > ⚠️ Enable GeoIP filtering **after** confirming your SSH connectivity, and add your own IP as a bypass if you connect from a country you did not whitelist.
 

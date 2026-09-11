@@ -77,18 +77,18 @@ norm_cc() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
 # English or Persian; everything space-stripped, English lowercase).
 CC_TABLE=(
 "IR|IRN|iran|ایران"
-"DE|DEU|germany|آلمان"
+"DE|DEU|germany|آلمان|deutschland"
 "US|USA|unitedstates|america|usa|امریکا|آمریکا"
-"GB|GBR|unitedkingdom|uk|britain|england|انگلستان|بریتانیا"
+"GB|GBR|unitedkingdom|uk|britain|england|انگلستان|بریتانیا|انگلیس"
 "TR|TUR|turkey|turkiye|ترکیه"
-"AE|ARE|unitedarabemirates|uae|dubai|امارات"
-"NL|NLD|netherlands|holland|هلند"
+"AE|ARE|unitedarabemirates|uae|dubai|امارات|دبی"
+"NL|NLD|netherlands|holland|هلند|nederland|nederlands"
 "FR|FRA|france|فرانسه"
 "CA|CAN|canada|کانادا"
 "RU|RUS|russia|روسیه"
 "CN|CHN|china|چین"
 "JP|JPN|japan|ژاپن"
-"KR|KOR|southkorea|korea|کره"
+"KR|KOR|southkorea|korea|کره|کرهجنوبی"
 "IN|IND|india|هند"
 "IQ|IRQ|iraq|عراق"
 "AF|AFG|afghanistan|افغانستان"
@@ -124,40 +124,217 @@ CC_TABLE=(
 "GE|GEO|georgia|گرجستان"
 "AR|ARG|argentina|آرژانتین"
 "BR|BRA|brazil|برزیل"
+"IE|IRL|ireland|ایرلند"
+"IS|ISL|iceland|ایسلند"
+"PT|PRT|portugal|پرتغال"
+"LU|LUX|luxembourg|لوکزامبورگ"
+"MT|MLT|malta|مالت"
+"CY|CYP|cyprus|قبرس"
+"HU|HUN|hungary|مجارستان"
+"BG|BGR|bulgaria|بلغارستان"
+"RS|SRB|serbia|صربستان"
+"HR|HRV|croatia|کرواسی"
+"SI|SVN|slovenia|اسلوونی"
+"SK|SVK|slovakia|اسلواکی"
+"LT|LTU|lithuania|لیتوانی"
+"LV|LVA|latvia|لتونی"
+"EE|EST|estonia|استونی"
+"BY|BLR|belarus|بلاروس"
+"MD|MDA|moldova|مولداوی"
+"AL|ALB|albania|آلبانی"
+"ME|MNE|montenegro|مونتهنگرو"
+"MK|MKD|northmacedonia|macedonia|مقدونیه"
+"BA|BIH|bosnia|bosniaandherzegovina|بوسنی"
+"IL|ISR|israel|اسرائیل"
+"PS|PSE|palestine|فلسطین"
+"SY|SYR|syria|سوریه"
+"YE|YEM|yemen|یمن"
+"SD|SDN|sudan|سودان"
+"LY|LBY|libya|لیبی"
+"TN|TUN|tunisia|تونس"
+"DZ|DZA|algeria|الجزایر"
+"MA|MAR|morocco|مراکش|مغرب"
+"NG|NGA|nigeria|نیجریه"
+"KE|KEN|kenya|کنیا"
+"ZA|ZAF|southafrica|افریقایجنوبی|آفریقایجنوبی"
+"TZ|TZA|tanzania|تانزانیا"
+"ET|ETH|ethiopia|اتیوپی"
+"GH|GHA|ghana|غنا"
+"UZ|UZB|uzbekistan|ازبکستان"
+"TJ|TJK|tajikistan|تاجیکستان"
+"TM|TKM|turkmenistan|ترکمنستان"
+"KG|KGZ|kyrgyzstan|قرقیزستان"
+"MN|MNG|mongolia|مغولستان"
+"TH|THA|thailand|تایلند"
+"VN|VNM|vietnam|ویتنام"
+"PH|PHL|philippines|فیلیپین"
+"SG|SGP|singapore|سنگاپور"
+"BD|BGD|bangladesh|بنگلادش"
+"LK|LKA|srilanka|سریلانکا"
+"NP|NPL|nepal|نپال"
+"MM|MMR|myanmar|burma|میانمار"
+"KH|KHM|cambodia|کامبوج"
+"TW|TWN|taiwan|تایوان"
+"HK|HKG|hongkong|هنگکنگ"
+"NZ|NZL|newzealand|نیوزیلند"
+"MX|MEX|mexico|مکزیک"
+"CL|CHL|chile|شیلی"
+"CO|COL|colombia|کلمبیا"
+"PE|PER|peru|پرو"
+"VE|VEN|venezuela|ونزوئلا"
+"EC|ECU|ecuador|اکوادور"
+"UY|URY|uruguay|اروگوئه"
+"PY|PRY|paraguay|پاراگوئه"
+"BO|BOL|bolivia|بولیوی"
+"CU|CUB|cuba|کوبا"
+"CR|CRI|costarica|کاستاریکا"
+"PA|PAN|panama|پاناما"
+"DO|DOM|dominicanrepublic|دومینیکن"
+"GT|GTM|guatemala|گواتمالا"
+"HN|HND|honduras|هندوراس"
+"SV|SLV|elsalvador|السالوادور"
+"NI|NIC|nicaragua|نیکاراگوئه"
+"PR|PRI|puertorico|پورتوریکو"
+"JM|JAM|jamaica|جامائیکا"
 )
 
-# resolve_cc <token> -> prints ISO alpha-2 code, or fails when unknown
-# Accepts: 2-letter code, alpha-3, exact English/Persian name, or a
-# UNIQUE prefix of the English name (e.g. "German" -> DE; "united" is
-# ambiguous and therefore rejected).
-resolve_cc() {
-    local in cc key entry code rest field found cnt
-    in="$(printf '%s' "$1" | tr -d '[:space:]')"
-    [ -z "$in" ] && return 1
-    cc="$(norm_cc "$in")"
-    if valid_cc "$cc"; then printf '%s\n' "$cc"; return 0; fi
-    key="$(printf '%s' "$in" | tr '[:upper:]' '[:lower:]')"
-    # pass 1: exact match on alpha-3 / English name / any alias
+# The three predicates below split a row's names on '|' with a local IFS.
+# (Table names are stored lowercase — the caller lowercases the input.)
+
+# 0 when the row carries this exact alpha-3 / name / alias
+# (alpha-3 codes are uppercase in the table, names lowercase)
+cc_has_name() {
+    local entry="$1" key="$2" rest field
+    rest="${entry#*|}"
+    local IFS='|'
+    for field in $rest; do case "${field,,}" in "$key") return 0 ;; esac; done
+    return 1
+}
+
+# 0 when any name/alias of the row starts with this key
+cc_has_prefix() {
+    local entry="$1" key="$2" rest field
+    rest="${entry#*|}"; rest="${rest#*|}"
+    local IFS='|'
+    for field in $rest; do case "$field" in "$key"*) return 0 ;; esac; done
+    return 1
+}
+
+# 0 when this key appears anywhere inside a name/alias of the row
+cc_has_part() {
+    local entry="$1" key="$2" rest field
+    rest="${entry#*|}"; rest="${rest#*|}"
+    local IFS='|'
+    for field in $rest; do case "$field" in *"$key"*) return 0 ;; esac; done
+    return 1
+}
+
+# 0 when an ASCII name/alias of the row is within $3 edits of the key
+# (a length pre-filter keeps the expensive distance call rare)
+cc_close_match() {
+    local entry="$1" key="$2" max="$3" rest field lk=${#2} lf
+    rest="${entry#*|}"; rest="${rest#*|}"
+    local IFS='|'
+    for field in $rest; do
+        case "$field" in *[!a-z0-9]*) continue ;; esac
+        lf=${#field}
+        if [ "$lf" -lt $((lk - max)) ] || [ "$lf" -gt $((lk + max)) ]; then continue; fi
+        [ "$(lev_dist "$key" "$field")" -le "$max" ] && return 0
+    done
+    return 1
+}
+
+# Levenshtein distance (ASCII strings only) — prints the distance
+lev_dist() {
+    local a="$1" b="$2" la=${#1} lb=${#2} i j cost del ins sub
+    local -a prev cur
+    for ((j = 0; j <= lb; j++)); do prev[j]=$j; done
+    for ((i = 1; i <= la; i++)); do
+        cur[0]=$i
+        for ((j = 1; j <= lb; j++)); do
+            cost=1; [ "${a:i-1:1}" = "${b:j-1:1}" ] && cost=0
+            del=$((prev[j] + 1)); ins=$((cur[j-1] + 1)); sub=$((prev[j-1] + cost))
+            cur[j]=$del
+            [ "$ins" -lt "${cur[j]}" ] && cur[j]=$ins
+            [ "$sub" -lt "${cur[j]}" ] && cur[j]=$sub
+        done
+        prev=("${cur[@]}")
+    done
+    printf '%s\n' "${prev[$lb]:-$lb}"
+}
+
+# Comma-joined candidates for a helpful "did you mean" line:
+#   "TR (turkey), TM (turkmenistan)"
+cc_suggest() {
+    local key="$1" entry code name out=""
+    [ -z "$key" ] && return 0
     for entry in "${CC_TABLE[@]}"; do
-        code="${entry%%|*}"; rest="${entry#*|}"
-        if [ "$key" = "$(printf '%s' "${rest%%|*}" | tr '[:upper:]' '[:lower:]')" ]; then
-            printf '%s\n' "$code"; return 0
+        code="${entry%%|*}"
+        if cc_has_prefix "$entry" "$key" || cc_has_part "$entry" "$key"; then
+            name="${entry#*|}"; name="${name#*|}"; name="${name%%|*}"
+            out="${out:+$out, }$code ($name)"
         fi
-        rest="${rest#*|}"
-        local IFS='|'
-        for field in $rest; do
-            if [ "$key" = "$(printf '%s' "$field" | tr '[:upper:]' '[:lower:]')" ]; then
-                printf '%s\n' "$code"; return 0
+    done
+    # nothing similar by name? fall back to close (typo) matches
+    if [ -z "$out" ]; then
+        case "$key" in *[!a-z0-9]*) return 0 ;; esac
+        [ "${#key}" -ge 5 ] || return 0
+        for entry in "${CC_TABLE[@]}"; do
+            code="${entry%%|*}"
+            if cc_close_match "$entry" "$key" 2; then
+                name="${entry#*|}"; name="${name#*|}"; name="${name%%|*}"
+                out="${out:+$out, }$code ($name)"
             fi
         done
+    fi
+    printf '%s' "$out"
+}
+
+# resolve_cc <token> -> prints ISO alpha-2 code, or fails when unknown
+# Accepts: 2-letter code, alpha-3, exact English/Persian name or alias,
+# a UNIQUE name prefix ("German" -> DE) or substring ("netherland" ->
+# NL), and a UNIQUE single-typo match ("nederlands" -> NL). Anything
+# ambiguous is refused — silently allowing the wrong country through a
+# firewall is worse than asking again.
+resolve_cc() {
+    local in key entry code found cnt
+    # Whitespace- and case-insensitive, in pure bash: the old version forked
+    # a `tr` per table row, which made a 120-country table take seconds.
+    in="${1//[[:space:]]/}"
+    [ -z "$in" ] && return 1
+    if valid_cc "${in^^}"; then printf '%s\n' "${in^^}"; return 0; fi
+    key="${in,,}"
+
+    # pass 1: exact match on alpha-3 / English name / Persian name / alias
+    for entry in "${CC_TABLE[@]}"; do
+        code="${entry%%|*}"
+        if cc_has_name "$entry" "$key"; then printf '%s\n' "$code"; return 0; fi
     done
-    # pass 2: unique prefix of the English primary name
+
+    # pass 2: unique prefix of a name or alias ("German" -> DE)
     found=""; cnt=0
     for entry in "${CC_TABLE[@]}"; do
-        code="${entry%%|*}"; rest="${entry#*|}"; rest="${rest#*|}"
-        case "${rest%%|*}" in
-            "$key"*) found="$code"; cnt=$((cnt + 1)) ;;
-        esac
+        code="${entry%%|*}"
+        if cc_has_prefix "$entry" "$key"; then found="$code"; cnt=$((cnt + 1)); fi
+    done
+    if [ "$cnt" -eq 1 ]; then printf '%s\n' "$found"; return 0; fi
+
+    # pass 3: unique substring of any name/alias ("netherland" -> NL)
+    found=""; cnt=0
+    for entry in "${CC_TABLE[@]}"; do
+        code="${entry%%|*}"
+        if cc_has_part "$entry" "$key"; then found="$code"; cnt=$((cnt + 1)); fi
+    done
+    if [ "$cnt" -eq 1 ]; then printf '%s\n' "$found"; return 0; fi
+
+    # pass 4: unique single-typo match ("nederlands" -> NL). ASCII only,
+    # and never for short tokens where one edit changes too much.
+    case "$key" in *[!a-z0-9]*) return 1 ;; esac
+    [ "${#key}" -ge 5 ] || return 1
+    found=""; cnt=0
+    for entry in "${CC_TABLE[@]}"; do
+        code="${entry%%|*}"
+        if cc_close_match "$entry" "$key" 2; then found="$code"; cnt=$((cnt + 1)); fi
     done
     if [ "$cnt" -eq 1 ]; then printf '%s\n' "$found"; return 0; fi
     return 1
@@ -173,6 +350,11 @@ geo_add_countries() {
         [ -z "$(printf '%s' "$cc" | tr -d '[:space:]')" ] && continue
         if ! resolved="$(resolve_cc "$cc")"; then
             warn "'$cc' is not a valid country code or name (e.g. IR, DE, Iran, Germany, ایران)."
+            local hint hkey
+            hkey="${cc//[[:space:]]/}"
+            hint="$(cc_suggest "${hkey,,}")"
+            [ -n "$hint" ] && info "Did you mean: $hint ?"
+            info "List every supported name with: vpssec geo names"
             continue
         fi
         cc="$resolved"
@@ -202,6 +384,11 @@ geo_remove_countries() {
         [ -z "$(printf '%s' "$cc" | tr -d '[:space:]')" ] && continue
         if ! resolved="$(resolve_cc "$cc")"; then
             warn "'$cc' is not a valid country code or name — skipped."
+            local hint hkey
+            hkey="${cc//[[:space:]]/}"
+            hint="$(cc_suggest "${hkey,,}")"
+            [ -n "$hint" ] && info "Did you mean: $hint ?"
+            info "List every supported name with: vpssec geo names"
             continue
         fi
         cc="$resolved"
@@ -527,10 +714,30 @@ geo_refresh() {
     return 0
 }
 
+# ---------- name lookup table ----------
+# Everything the country resolver understands, so an admin never has to
+# guess: code, primary English name and the accepted aliases.
+cc_list_all() {
+    local entry code rest names first
+    printf '  %-4s %-22s %s\n' "CODE" "TYPE THIS NAME" "ALSO ACCEPTS"
+    printf '  %s\n' "--------------------------------------------------------------"
+    for entry in "${CC_TABLE[@]}"; do
+        code="${entry%%|*}"
+        rest="${entry#*|}"; rest="${rest#*|}"
+        first="${rest%%|*}"
+        names="${rest#*|}"
+        if [ "$names" = "$rest" ]; then names=""; else names="${names//|/, }"; fi
+        printf '  %-4s %-22s %s\n' "$code" "$first" "$names"
+    done
+    printf '\n  %s countries supported. Type a code, a full name or a\n' "${#CC_TABLE[@]}"
+    printf '  unique abbreviation, e.g.  IR   Germany   آلمان   netherlands\n'
+}
+
 case "${1:-}" in
     --add)    shift; need_root; geo_add_countries "${1:-}";;
     --remove) shift; need_root; geo_remove_countries "${1:-}";;
     --list)   geo_list ;;
+    --names)  cc_list_all ;;
     --enable) need_root; geo_enable ;;
     --disable) need_root; geo_disable ;;
     --bypass) shift; geo_bypass "${1:-}" "${2:-}" ;;
@@ -547,5 +754,5 @@ case "${1:-}" in
         geo_write_rules 2>/dev/null || true
         ;;
     --health) geo_enabled ;;
-    *) die "usage: geoip.sh (--add <CC,..>|--remove <CC,..>|--list|--enable|--disable|--bypass|--refresh|--health)" ;;
+    *) die "usage: geoip.sh (--add <CC,..>|--remove <CC,..>|--list|--names|--enable|--disable|--bypass|--refresh|--health)" ;;
 esac

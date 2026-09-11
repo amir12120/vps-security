@@ -31,7 +31,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.3.3 — server hardening toolkit
+  vps-security v1.3.4 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────
@@ -121,13 +121,21 @@ sudo vpssec
 
 از منوی **🌍 GeoIP country filter** (یا `vpssec geo ...`):
 
-1. **➕ افزودن کشورهای مجاز** — هر تعداد کشور وارد کنید: کد دوحرفی (`IR,DE,TR,US`)، **نام کامل** (`Iran,Germany,Turkey`)، نام فارسی (`ایران,آلمان,ترکیه`)، کد سه‌حرفی ISO (`USA`) یا پیشوند یکتای نام — لیست نامحدود است. ورودی نامعتبر یا مبهم با هشدار واضح رد می‌شود.
+1. **➕ افزودن کشورهای مجاز** — هر تعداد کشور، با هر املایی که راحت هستید وارد کنید؛ **بیش از ۱۲۰ کشور** از قبل شناخته شده‌اند و تطبیق نام‌ها انعطاف‌پذیر است:
+   - کد دوحرفی: `IR,DE,TR,US`
+   - **نام کامل**: `Iran,Germany,Netherlands,Turkey`
+   - **نام فارسی**: `ایران,آلمان,هلند,ترکیه`
+   - کد سه‌حرفی ISO با هر بزرگی/کوچکی: `USA,IRN,deu`
+   - **نام‌های جایگزین**: `holland`، `deutschland`، `england`، `dubai`، `america`، `korea`
+   - شکل کوتاه و غلط تایپی ساده: `netherland`، `nederlands`، `germny`، `qater` هم تشخیص داده می‌شوند
+   - ورودی ناشناخته یا **مبهم** هیچ تغییری ایجاد نمی‌کند و راهنما نشان می‌دهد: `'Turk' is not a valid country code or name … Did you mean: TR (turkey), TM (turkmenistan) ?`
+   - کد را حفظ نیستید؟ گزینه **📖 Country codes & names** در منو (یا `vpssec geo names`) جدول کامل کد/نام/نام‌های جایگزین را چاپ می‌کند.
 2. **✅ Enable filtering** — لیست CIDR هر کشور دانلود (پایگاه داده IPFire، به‌روزرسانی روزانه) و در یک **ipset** بارگذاری می‌شود و ufw طوری تنظیم می‌شود که *فقط* کشورهای انتخابی به سرور دسترسی داشته باشند — بقیه دراپ می‌شوند
 3. **🛟 Bypass** — IP خودتان را اضافه کنید تا حتی از کشور مسدود هم هرگز بلاک نشود (منو، IP عمومی فعلی شما را نشان می‌دهد)
 4. **♻️ Refresh** — لیست‌ها هر هفته خودکار به‌روز می‌شوند؛ هر زمان بخواهید می‌توانید دستی به‌روزرسانی کنید
 5. **⛔ Disable** — همه قوانین فوراً حذف می‌شوند؛ دوباره همه کشورها می‌توانند متصل شوند
 
-دستورات مستقیم: `vpssec geo add IR,DE` (کد، نام کامل یا نام فارسی) · `vpssec geo remove TR` · `vpssec geo list` · `vpssec geo enable|disable` · `vpssec geo bypass <ip>` · `vpssec geo refresh`
+دستورات مستقیم: `vpssec geo add IR,DE` (کد، نام کامل یا نام فارسی) · `vpssec geo remove TR` · `vpssec geo names` (جدول راهنما) · `vpssec geo list` · `vpssec geo enable|disable` · `vpssec geo bypass <ip>` · `vpssec geo refresh`
 
 > ⚠️ فیلتر جغرافیایی را **بعد از** اطمینان از سلامت اتصال SSH فعال کنید، و اگر از کشوری متصل می‌شوید که در لیست مجاز ندارید، حتماً IP خودتان را در Bypass اضافه کنید.
 

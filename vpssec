@@ -18,7 +18,7 @@
 #   maint        RAM cache & log cleanup (run / status)
 #   mirror       Best Iranian mirror & DNS (best / test / reset / status)
 #   shield       Bot & Scanner Shield (enable / disable / status)
-#   geo          Country filter (add / remove / list / enable / disable / bypass / refresh)
+#   geo          Country filter (add / remove / list / names / enable / disable / bypass / refresh)
 #   logs         Show monitor log
 #   uninstall    Remove vps-security completely
 #   help         Show this help
@@ -65,7 +65,7 @@ fi
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.3.3"
+VERSION="1.3.4"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
 REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
 REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"
@@ -1017,7 +1017,7 @@ Commands:
   maint        RAM cache & log cleanup (run / status)
   mirror       Best Iranian mirror & DNS (best / test / reset / status)
   shield       Bot & Scanner Shield (enable / disable / status)
-  geo          Country filter (add / remove / list / enable / disable / bypass / refresh)
+  geo          Country filter (add / remove / list / names / enable / disable / bypass / refresh)
   logs         Show monitor log
   uninstall    Remove vps-security completely
   help         Show this help
@@ -1251,6 +1251,7 @@ action_geo_menu() {
             "⛔ Disable filtering" \
             "🛟 Never block an IP (bypass)" \
             "♻️  Refresh country lists" \
+            "📖 Country codes & names (lookup)" \
             "🚪 Back"
         case "$MENU_IDX" in
             1) action_geo_add; ui_press_any_key ;;
@@ -1260,7 +1261,8 @@ action_geo_menu() {
             5) bash "$SCRIPT_DIR/lib/geoip.sh" --disable; ui_press_any_key ;;
             6) action_geo_bypass; ui_press_any_key ;;
             7) bash "$SCRIPT_DIR/lib/geoip.sh" --refresh; ui_press_any_key ;;
-            0|8) return 0 ;;
+            8) bash "$SCRIPT_DIR/lib/geoip.sh" --names; ui_press_any_key ;;
+            0|9) return 0 ;;
         esac
     done
 }
@@ -1301,6 +1303,8 @@ action_geo_add() {
     ui_title "Add Allowed Countries"
     info "Enter country codes or full country names, comma-separated."
     info "Examples: IR, Germany, ایران, USA, Turkey — as many as you want."
+    info "Spelling is forgiving (netherlands / holland / NL all work)."
+    info "Not sure of a code?  See the lookup table: vpssec geo names"
     prompt "Countries (e.g. IR,DE or Iran,Germany): "
     read -r ccs
     [ -z "$ccs" ] && { info "Cancelled."; return 0; }
@@ -1310,7 +1314,8 @@ action_geo_add() {
 action_geo_remove() {
     ui_title "Remove Allowed Countries"
     bash "$SCRIPT_DIR/lib/geoip.sh" --list
-    info "Country codes or full names both work (e.g. TR or Turkey)."
+    info "Country codes or full names both work (e.g. TR, Turkey, ترکیه)."
+    info "Not sure of a code?  See the lookup table: vpssec geo names"
     prompt "Countries to remove: "
     read -r ccs
     [ -z "$ccs" ] && { info "Cancelled."; return 0; }
@@ -1335,6 +1340,7 @@ cmd_geo() {
         disable) need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --disable ;;
         refresh) need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --refresh ;;
         bypass)  need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --bypass "${2:-add}" "${3:-}" ;;
+        names)   bash "$SCRIPT_DIR/lib/geoip.sh" --names ;;
         list)    bash "$SCRIPT_DIR/lib/geoip.sh" --list ;;
         *)       bash "$SCRIPT_DIR/lib/geoip.sh" --list ;;
     esac
@@ -1356,8 +1362,7 @@ case "${1:-}" in
     update)    cmd_update ;;
     logs)      shift; cmd_logs "$@" ;;
     uninstall) cmd_uninstall ;;
-    shield)    shift; cmd_shield "$@" ;;
-    geo)       shift; cmd_geo "$@" ;;
+    shield)    shift; cmd_shield "$@" ;;        geo)     shift; cmd_geo "$@" ;;
     maint)     shift; cmd_maint "$@" ;;
     mirror)    shift; cmd_mirror "$@" ;;
     help|-h|--help) cmd_help ;;
