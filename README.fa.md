@@ -11,8 +11,8 @@
 3. **فایروال (ufw)** — نصب ufw، باز کردن **فقط** پورت‌هایی که تأیید می‌کنید و فعال‌سازی فایروال. اگر **هیچ پورتی مشخص نکنید**، فایروال **غیرفعال** می‌ماند و سرور روی همه پورت‌ها باز می‌شود
 4. **مانیتور پورت‌های غریبه** — هر ۳۰ دقیقه اتصال‌های فعال اسکن می‌شوند؛ هر پورتی که در لیست مجاز شما نباشد و در حال انتقال داده باشد **به مدت ۱ ساعت از طریق ufw مسدود می‌شود** و سپس خودکار آزاد می‌شود
 5. **سپر بات و اسکنر** — محدودیت نرخ اتصال برای هر IP، حذف بسته‌های اسکن با فلگ‌های TCP (NULL / SYN+FIN / SYN+RST / ALL) و بن خودکار IPهای مهاجم به مدت یک ساعت
-6. **نگهداری خودکار (Maintenance)** — هر ۲ روز یک‌بار رم-کش پاک می‌شود (`drop_caches`)، لاگ‌های چرخشی حذف، لاگ‌های فعال معمول کوتاه و ژورنال systemd خلاکس می‌شود. پاک‌کردن swap به‌صورت پیش‌فرض **خاموش** است (روی سرور شلوغ `swapoff` می‌تواند OOM killer را فعال کند)؛ با `MAINT_CLEAR_SWAP=1` در `lib/maintain.sh` فعال کنید
-6. **فیلتر جغرافیایی (GeoIP)** — اجازه دسترسی به **هر تعداد کشور** که می‌خواهید (مثلاً فقط ایران و آلمان) و مسدود کردن بقیه کشورها
+6. **نگهداری خودکار (Maintenance)** — هر ۲ روز یک‌بار رم-کش پاک می‌شود (`drop_caches`)، لاگ‌های چرخشی حذف، لاگ‌های فعال معمول کوتاه و ژورنال systemd خلاکس می‌شود. پاک‌کردن swap به‌صورت پیش‌فرض **خاموش** است؛ با `MAINT_CLEAR_SWAP=1` در `lib/maintain.sh` فعال کنید
+7. **فیلتر جغرافیایی (GeoIP)** — اجازه دسترسی به **هر تعداد کشور** که می‌خواهید (مثلاً فقط ایران و آلمان) و مسدود کردن بقیه کشورها
 
 ---
 
@@ -31,7 +31,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.2.0 — server hardening toolkit
+  vps-security v1.3.1 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────
@@ -44,8 +44,10 @@ sudo vpssec
     🔓 Unblock a port
     📜 Monitor logs
     ⬆️  Update vps-security
+    🧹 Maintenance — RAM cache & log cleanup
     🛡️  Bot & Scanner Shield
     🌍 GeoIP country filter
+    🏁 The best Iranian mirror & DNS
     🗑️  Uninstall vps-security
     🚪 Exit
 ```
@@ -54,7 +56,7 @@ sudo vpssec
 
 | دستور | توضیح |
 |---|---|
-| `sudo vpssec install` | راه‌اندازی کامل تعاملی (۴ مرحله بالا) |
+| `sudo vpssec install` | راه‌اندازی کامل تعاملی |
 | `sudo vpssec status` | داشبورد: فایروال، SSH، مانیتور و شمارنده‌ها |
 | `sudo vpssec ports` | افزودن / حذف / مشاهده پورت‌های مجاز |
 | `sudo vpssec port` | تغییر پورت SSH |
@@ -126,15 +128,17 @@ sudo vpssec
 | مسیر | کاربرد |
 |---|---|
 | `/usr/local/bin/vpssec` | نقطه ورود CLI |
-| `/usr/local/share/vps-security/` | کتابخانه‌های نصب‌شده (monitor، guard) |
+| `/usr/local/share/vps-security/` | کتابخانه‌های نصب‌شده (monitor، guard، shield، geo، maintenance، mirror) |
 | `/etc/vps-security/allowed-ports.list` | پورت‌های تأییدشده شما |
 | `/etc/vps-security/monitor.conf` | تنظیمات مانیتور (پورت‌های خود برنامه) |
 | `/etc/vps-security/botshield.conf` | تنظیمات سپر بات |
 | `/etc/vps-security/geo.conf` | تنظیمات فیلتر جغرافیایی |
+| `/etc/vps-security/mirror.conf` | میرور و DNS اعمال‌شده |
 | `/var/lib/vps-security/blocked-ports.list` | پورت‌های مسدود فعلی |
 | `/var/lib/vps-security/shield-bans.list` | IPهای بن‌شده |
-| `/var/lib/vps-security/*.log` | لاگ‌های مانیتور، بن و جغرافیا |
-| `/etc/systemd/system/vps-security-*` | یونیت‌های systemd (مانیتور، سپر، جغرافیا) |
+| `/var/lib/vps-security/*.log` | لاگ‌های مانیتور، بن، جغرافیا و نگهداری |
+| `/etc/systemd/system/vps-security-*` | یونیت‌های systemd (مانیتور، سپر، جغرافیا، نگهداری) |
+| `/etc/systemd/system/vps-security-guard.service` | API وضعیت محلی |
 
 ## API محافظ (نقطه پایانی وضعیت محلی)
 
@@ -145,12 +149,11 @@ curl http://127.0.0.1:18080/health   # {"status":"ok"}
 curl http://127.0.0.1:18080/status   # پورت‌های مجاز، مسدود و رویدادها
 ```
 
-به‌صورت پیش‌فرض فقط محلی است — بدون یک reverse proxy دارای احراز هویت آن را عمومی نکنید. برای داشبورد از راه دوری که در آینده اضافه خواهد شد آماده است.
+به‌صورت پیش‌فرض فقط محلی است — بدون یک reverse proxy دارای احراز هویت آن را عمومی نکنید.
 
 ## نکات ایمنی
 
 - تغییر پورت SSH از `sshd_config` **پشتیبان** می‌گیرد، با `sshd -t` اعتبارسنجی می‌کند و در صورت بالا نیامدن sshd روی پورت جدید، **خودکار به حالت قبل برمی‌گردد**.
-- پورت قدیمی SSH تا زمانی که پورت جدید را تأیید نکنید باز می‌ماند و فقط با تأیید شما بسته می‌شود.
 - ufw **بعد از** مجاز شدن پورت‌های شما (از جمله SSH) فعال می‌شود، پس هرگز خودتان را قفل نمی‌کنید.
 - `vpssec uninstall` یک **بازنشانی کامل (factory reset)** انجام می‌دهد: تمام سرویس‌ها متوقف و حذف می‌شوند، همه فایل‌های تنظیمات و وضعیت پاک می‌شوند، پورت SSH به **۲۲** برمی‌گردد و `ufw reset` → `ufw allow 22` → `ufw disable` اجرا می‌شود؛ در نتیجه سرور دقیقاً مثل روز اول — باز و با SSH روی پورت ۲۲ — باقی می‌ماند.
 

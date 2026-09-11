@@ -10,9 +10,9 @@
 2. **SSH port change** — moves SSH off port 22 to a port you choose (with automatic rollback if sshd fails to come back)
 3. **Firewall (ufw)** — installs ufw, opens **only** the ports you approve and enables it. If you specify **no ports at all**, the firewall is left **disabled** and the server stays open on every port
 4. **Rogue-port monitor** — every 30 minutes scans live connections; any port **not** in your allow-list that is actively transferring data gets **blocked via ufw for 1 hour**, then automatically released
-5. **Maintenance** — every 2 days clears the RAM cache (`drop_caches`), removes rotated logs, truncates the usual active logs, and vacuums the systemd journal. Optional swap clear is **off by default** (on a busy VPS `swapoff` can trigger the OOM killer); enable it in `lib/maintain.sh` via `MAINT_CLEAR_SWAP=1`
 5. **Bot & Scanner Shield** — per-IP connection rate limits, TCP-flag scan drops (NULL / SYN+FIN / SYN+RST / ALL), and auto-ban of SYN-flooding IPs for one hour
-6. **GeoIP country filter** — allow **any number of countries** you choose (e.g. only Iran and Germany) and block every other country from reaching the server
+6. **Maintenance** — every 2 days clears the RAM cache (`drop_caches`), removes rotated logs, truncates the usual active logs, and vacuums the systemd journal. Optional swap clear is **off by default**; enable it in `lib/maintain.sh` via `MAINT_CLEAR_SWAP=1`
+7. **GeoIP country filter** — allow **any number of countries** you choose (e.g. only Iran and Germany) and block every other country from reaching the server
 
 ---
 
@@ -31,7 +31,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.2.0 — server hardening toolkit
+  vps-security v1.3.1 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────
@@ -44,8 +44,10 @@ sudo vpssec
     🔓 Unblock a port
     📜 Monitor logs
     ⬆️  Update vps-security
+    🧹 Maintenance — RAM cache & log cleanup
     🛡️  Bot & Scanner Shield
     🌍 GeoIP country filter
+    🏁 The best Iranian mirror & DNS
     🗑️  Uninstall vps-security
     🚪 Exit
 ```
@@ -54,14 +56,14 @@ Navigate with **↑/↓** (or `j`/`k`), select with **Enter**, go back with **q*
 
 | Command | Description |
 |---|---|
-| `sudo vpssec install` | Full guided setup (the 4 steps above) |
+| `sudo vpssec install` | Full guided setup |
 | `sudo vpssec status` | Dashboard: firewall, SSH, monitor, counts |
 | `sudo vpssec ports` | Add / remove / list allowed ports |
 | `sudo vpssec port` | Change the SSH port |
 | `sudo vpssec scan` | Run a rogue-port scan right now |
 | `sudo vpssec blocked` | View blocked ports + time until auto-release |
 | `sudo vpssec unblock [port]` | Release a blocked port immediately |
-| `sudo vpssec update` | Update vps-security from GitHub (`git pull` in place) |
+| `sudo vpssec update` | Update vps-security from GitHub |
 | `sudo vpssec maint run` | Run the RAM-cache & log cleanup right now |
 | `sudo vpssec maint status` | Maintenance timer state + recent runs |
 | `sudo vpssec shield status` | Bot & Scanner Shield state + banned IPs |
@@ -85,25 +87,11 @@ On Iranian servers, GitHub is often slow or unreachable. The **🏁 The best Ira
 - The scanner reads live connections from `ss -tunap` and collects the **local ports with active traffic** (established TCP, connected UDP).
 - Any such port **not** in `/etc/vps-security/allowed-ports.list` is added to ufw as `deny <port>/{tcp,udp}` for **3600 seconds**.
 - After the hour expires, the next scan removes the rule and logs `UNBLOCK`.
-- View currently blocked ports (with a live countdown) via the **⛔ View blocked ports** menu or `vpssec blocked`.
-- Release a port early via **🔓 Unblock a port** or `vpssec unblock <port>`.
+- View currently blocked ports (with a live countdown) via the **⛔ View blocked ports** menu or `vpssec blocked`; release a port early via **🔓 Unblock a port** or `vpssec unblock <port>`.
 - The SSH port itself and the monitor's own ports are **never** blocked — even if they are not in the allow-list.
 - All actions are logged to `/var/lib/vps-security/port-blocks.log` and `/var/lib/vps-security/monitor.log`.
 
 > **Note:** the scanner sees ports with live connections. A port that only *listens* without transferring data is not flagged — this keeps the tool safe around services that legitimately listen (docker proxies, panel sockets, …).
-
-## Files and paths
-
-| Path | Purpose |
-|---|---|
-| `/usr/local/bin/vpssec` | CLI entry point |
-| `/usr/local/share/vps-security/` | Installed libraries (monitor, guard) |
-| `/etc/vps-security/allowed-ports.list` | Your approved ports |
-| `/etc/vps-security/monitor.conf` | Monitor config (self ports) |
-| `/var/lib/vps-security/blocked-ports.list` | Currently blocked ports |
-| `/var/lib/vps-security/*.log` | Monitor and block logs |
-| `/etc/systemd/system/vps-security-monitor.{service,timer}` | Scanner units |
-| `/etc/systemd/system/vps-security-guard.service` | Local status API |
 
 ## Bot & Scanner Shield
 
@@ -118,7 +106,7 @@ Enable it from the **🛡️ Bot & Scanner Shield** menu (or `vpssec shield enab
 
 From the **🌍 GeoIP country filter** menu (or `vpssec geo ...`):
 
-1. **➕ Add allowed countries** — enter any number of countries: 2-letter codes (`IR,DE,TR,US`), **full names** (`Iran,Germany, Turkey`), Persian names (`ایران,آلمان`), ISO alpha-3 (`USA`), or unique name prefixes — the list is unlimited. Invalid or ambiguous entries are rejected with a clear warning.
+1. **➕ Add allowed countries** — enter any number of countries: 2-letter codes (`IR,DE,TR,US`), **full names** (`Iran,Germany,Turkey`), Persian names (`ایران,آلمان,ترکیه`), ISO alpha-3 (`USA`), or unique name prefixes — the list is unlimited. Invalid or ambiguous entries are rejected with a clear warning.
 2. **✅ Enable filtering** — downloads each country's IPv4 CIDR list (IPFire location database, updated daily), loads them into an **ipset**, and wires ufw so that *only* those countries can reach the server — everyone else is dropped
 3. **🛟 Bypass** — add your own IP so it is never geo-blocked, even from a blocked country (the menu shows your current public IP)
 4. **♻️ Refresh** — country lists refresh automatically every week; refresh manually any time
@@ -134,6 +122,23 @@ Direct commands: `vpssec geo add IR,DE` (codes, full names, or Persian names) ·
 > - **Removing the last allowed country** while filtering is active automatically disables the filter and re-opens the server to all countries.
 > - **At boot**, an unsafe config (no countries / empty lists / no bypass) never re-applies the world-DROP rule.
 
+## Files and paths
+
+| Path | Purpose |
+|---|---|
+| `/usr/local/bin/vpssec` | CLI entry point |
+| `/usr/local/share/vps-security/` | Installed libraries (monitor, guard, shield, geo, maintenance, mirror) |
+| `/etc/vps-security/allowed-ports.list` | Your approved ports |
+| `/etc/vps-security/monitor.conf` | Monitor config (self ports) |
+| `/etc/vps-security/botshield.conf` | Bot & Scanner Shield config |
+| `/etc/vps-security/geo.conf` | GeoIP config (countries, bypass IPs) |
+| `/etc/vps-security/mirror.conf` | Applied mirror & DNS choice |
+| `/var/lib/vps-security/blocked-ports.list` | Currently blocked ports |
+| `/var/lib/vps-security/shield-bans.list` | Banned IPs |
+| `/var/lib/vps-security/*.log` | Monitor, ban, geo and maintenance logs |
+| `/etc/systemd/system/vps-security-*` | systemd units (monitor, shield, geo, maintenance) |
+| `/etc/systemd/system/vps-security-guard.service` | Local status API |
+
 ## Guard API (local status endpoint)
 
 The optional guard service serves monitor state on `127.0.0.1:18080`:
@@ -143,18 +148,17 @@ curl http://127.0.0.1:18080/health   # {"status":"ok"}
 curl http://127.0.0.1:18080/status   # allowed, blocked, recent events
 ```
 
-It stays local-only by default — do not expose it publicly without an authenticated reverse proxy. It is ready as a data source for a future remote dashboard.
+It stays local-only by default — do not expose it publicly without an authenticated reverse proxy.
 
 ## Safety notes
 
 - The SSH-port change **backs up** `sshd_config`, validates with `sshd -t`, and **rolls back automatically** if sshd does not come up on the new port.
-- The old SSH port stays open until you confirm the new one works, and is only closed after you approve.
 - ufw is enabled **after** your approved ports (including SSH) are allowed, so you can never lock yourself out.
 - `vpssec uninstall` performs a **full factory reset**: stops and removes all services, deletes every vps-security config/state file, restores the SSH port to **22**, and runs `ufw reset` → `ufw allow 22` → `ufw disable`, so the server ends up exactly as it started — open, with SSH on port 22.
 
 ## Requirements
 
-- Ubuntu 20.04+ / Debian 11+ (uses `ss`, `ufw`, `systemd`, `python3` for the guard API)
+- Ubuntu 20.04+ / Debian 11+ (uses `ss`, `ufw`, `systemd`, `python3` for the guard API, `ipset` for the GeoIP filter — auto-installed when needed)
 - root access
 
 ## Roadmap
