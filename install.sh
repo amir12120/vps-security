@@ -53,8 +53,19 @@ chmod +x "$TARGET/vpssec" "$TARGET"/lib/*.sh "$TARGET"/test/*.sh 2>/dev/null || 
 # Convenience symlink
 ln -sf "$TARGET/vpssec" /usr/local/bin/vpssec
 
+# The symlinked CLI must be able to start and load its own libraries.
+if ! bash "$TARGET/vpssec" version >/dev/null 2>&1; then
+    echo "[✗] The vpssec CLI failed to start. Debug it with:" >&2
+    echo "      sudo vpssec version" >&2
+    exit 1
+fi
+
 echo
 echo "[✓] Repository ready at $TARGET"
-echo "[i] Launching the interactive installer — answer the prompts..."
+echo "[i] CLI installed as: vpssec"
+echo
+echo "[i] Launching the interactive installer — answer the prompts."
+echo "[i] When the setup steps finish, the vpssec menu opens by itself:"
+echo "[i] use the arrow keys, q to go back and 'Exit' to leave."
 echo
 exec bash "$TARGET/vpssec" install

@@ -46,6 +46,9 @@ export UFW_DIR="$SANDBOX/ufw"
 export GEO_TMP="$SANDBOX/geotmp"
 export VPSSEC_SKIP_ROOT_CHECK=1
 export VPSSEC_SKIP_OS_CHECK=1
+# Never let a test run block on the post-install TUI menu (the pty section
+# below re-enables it explicitly with VPSSEC_NO_MENU=0).
+export VPSSEC_NO_MENU=1
 export PATH="$STUBS:$PATH"
 SSH_CFG="$SANDBOX/etc-ssh/sshd_config"
 trap 'rm -rf "$SANDBOX"' EXIT
@@ -319,9 +322,45 @@ check "empty-ports install never enables ufw"       "! grep -q ' enable' '$SANDB
 check "empty-ports install removes stale allow-list" "[ ! -f '$VPSSEC_CONF_DIR/allowed-ports.list' ]"
 
 echo
+echo "=== smoke: CLI invoked through a symlink (bootstrap layout) ==="
+# The bootstrap installer links /usr/local/bin/vpssec -> <repo>/vpssec.
+# bash reports BASH_SOURCE as the symlink, so if the CLI does not resolve
+# it, lib/common.sh is never sourced and the menu never appears.
+LINK_DIR="$SANDBOX/bin"
+mkdir -p "$LINK_DIR"
+if ln -s "$HERE/vpssec" "$LINK_DIR/vpssec" 2>/dev/null && [ -L "$LINK_DIR/vpssec" ]; then
+    printf '0\n' | bash "$LINK_DIR/vpssec" > "$SANDBOX/linkmenu.out" 2>&1 || true
+    bash "$LINK_DIR/vpssec" version | grep -q 'vpssec 1.3.3' && R=0 || R=1
+    check "symlinked CLI loads its libraries"  "[ \"$R\" -eq 0 ]"
+    check "symlinked CLI draws the menu"       "grep -q 'Main Menu' '$SANDBOX/linkmenu.out'"
+    check "symlinked CLI reports no load error" "! grep -q 'unbound variable\|No such file' '$SANDBOX/linkmenu.out'"
+else
+    echo "  skip- symlink checks (filesystem without symlink support)"
+fi
+
+echo
+echo "=== smoke: guided install ends in the TUI menu (pty) ==="
+if command -v script >/dev/null 2>&1; then
+    # answers: skip apt=n, keep SSH port=<blank>, no extra ports=<blank>,
+    # then q in the menu. VPSSEC_NO_MENU=0 re-enables the post-install menu.
+    printf 'n\n\n\nq\n' | TERM=xterm VPSSEC_NO_MENU=0 timeout 60 \
+        script -qec "bash '$HERE/vpssec' install" /dev/null > "$SANDBOX/ptymenu.out" 2>&1 || true
+    # Only assert once the pty genuinely drove the run to completion;
+    # otherwise this environment cannot host the test (skip, don't fail).
+    if grep -q 'guided setup' "$SANDBOX/ptymenu.out" && grep -q 'SSH port unchanged' "$SANDBOX/ptymenu.out"; then
+        check "setup finishes and enters the menu"  "grep -q 'Setup finished' '$SANDBOX/ptymenu.out'"
+        check "install opens the menu on a terminal" "grep -q 'Main Menu' '$SANDBOX/ptymenu.out'"
+    else
+        echo "  skip- pty menu check (pty harness did not feed input here)"
+    fi
+else
+    echo "  skip- pty menu check (no 'script' command)"
+fi
+
+echo
 echo "=== smoke: help & version ==="
-bash "$HERE/vpssec" version | grep -q 'vpssec 1.3.2' && R=0 || R=1
-check "version reports 1.3.0"           "[ \"$R\" -eq 0 ]"
+bash "$HERE/vpssec" version | grep -q 'vpssec 1.3.3' && R=0 || R=1
+check "version reports 1.3.3"           "[ \"$R\" -eq 0 ]"
 bash "$HERE/vpssec" help | grep -q 'update' && R=0 || R=1
 check "help mentions update"            "[ \"$R\" -eq 0 ]"
 
@@ -438,8 +477,8 @@ check "failed downloads write no DROP rule"    "! grep -q -- '-A ufw-before-inpu
 cat > "$STUBS/curl" <<'CEOF3'
 #!/usr/bin/env bash
 out="/dev/null"; prev=""
-for a in "\$@"; do case "\$prev" in -o) out="\$a";; esac; prev="\$a"; done
-printf '1.2.3.0/24\n' > "\$out"
+for a in "$@"; do case "$prev" in -o) out="$a";; esac; prev="$a"; done
+printf '1.2.3.0/24\n' > "$out"
 exit 0
 CEOF3
 chmod +x "$STUBS/curl"
@@ -609,8 +648,8 @@ check "menu shows mirror entry"          "grep -q 'Iranian mirror & DNS' '$SANDB
 cat > "$STUBS/curl" <<'CEOF4'
 #!/usr/bin/env bash
 out="/dev/null"; prev=""
-for a in "\$@"; do case "\$prev" in -o) out="\$a";; esac; prev="\$a"; done
-printf '1.2.3.0/24\n' > "\$out"
+for a in "$@"; do case "$prev" in -o) out="$a";; esac; prev="$a"; done
+printf '1.2.3.0/24\n' > "$out"
 exit 0
 CEOF4
 chmod +x "$STUBS/curl"

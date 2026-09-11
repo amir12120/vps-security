@@ -22,7 +22,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/amir12120/vps-security/main/install.sh)
 ```
 
-The installer clones this repo to `/opt/vps-security`, installs the `vpssec` command, and starts the guided setup.
+The installer clones this repo to `/opt/vps-security`, installs the `vpssec` command, and starts the guided setup. **When the steps finish, the `vpssec` menu opens by itself** — the same menu you get any time later with `sudo vpssec`.
 
 ## Interactive TUI
 
@@ -31,7 +31,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.3.1 — server hardening toolkit
+  vps-security v1.3.3 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────
@@ -169,6 +169,13 @@ It stays local-only by default — do not expose it publicly without an authenti
 - The SSH-port change **backs up** `sshd_config`, validates with `sshd -t`, and **rolls back automatically** if sshd does not come up on the new port.
 - ufw is enabled **after** your approved ports (including SSH) are allowed, so you can never lock yourself out.
 - `vpssec uninstall` performs a **full factory reset**: stops and removes all services, deletes every vps-security config/state file, restores the SSH port to **22**, and runs `ufw reset` → `ufw allow 22` → `ufw disable`, so the server ends up exactly as it started — open, with SSH on port 22.
+
+## Troubleshooting
+
+- **The `vpssec` menu does not appear.** Run `sudo vpssec --version` and `sudo vpssec help`: if the CLI prints an error like *libraries not found*, the install is incomplete — re-run the one-line installer.
+- **Nothing happens over SSH?** The CLI needs a terminal. Over a plain pipe (CI, `cron`, some web consoles) it automatically switches to a numbered menu instead of the arrow-key TUI.
+- **Automation / unattended installs.** Export `VPSSEC_NO_MENU=1` to run `vpssec install` without opening the menu when it finishes.
+- **Just want the menu back after a command?** Any command exits back to your shell; run `sudo vpssec` to reopen the menu.
 
 ## Requirements
 
