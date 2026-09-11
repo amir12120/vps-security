@@ -32,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.3.1"
+VERSION="1.3.2"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
 REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
 REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"
@@ -469,6 +469,7 @@ Description=vps-security maintenance (RAM cache + log cleanup)
 
 [Service]
 Type=oneshot
+EnvironmentFile=-$VPSSEC_CONF_DIR/maintain.conf
 ExecStart=$INSTALL_DIR/lib/maintain.sh --run
 EOF
 
@@ -478,6 +479,7 @@ Description=Run vps-security maintenance every 2 days
 
 [Timer]
 OnBootSec=10min
+RandomizedDelaySec=15min
 OnUnitActiveSec=2d
 Persistent=true
 Unit=vps-security-maint.service
@@ -991,28 +993,113 @@ show_menu() {
 # Maintenance — RAM cache & log cleanup (every 2 days)
 # ============================================================
 
+MAINT_CONF="$VPSSEC_CONF_DIR/maintain.conf"
+
+# Write (or update) the maintenance env file consumed by the systemd
+# unit via EnvironmentFile — lets admins tune limits without editing
+# the installed library. Only non-default values are written.
+cfg_write_maint_conf() {
+    ensure_dirs
+    {
+        echo "# vps-security maintenance settings (used by the systemd timer)"
+        echo "MAINT_CLEAR_SWAP=${MAINT_CLEAR_SWAP:-0}"
+        echo "MAINT_JOURNAL_MAX=${MAINT_JOURNAL_MAX:-200M}"
+        echo "MAINT_JOURNAL_MAX_TIME=${MAINT_JOURNAL_MAX_TIME:-7d}"
+        [ -n "${MAINT_EXCLUDE:-}" ] && echo "MAINT_EXCLUDE=$MAINT_EXCLUDE"
+    } > "$MAINT_CONF"
+    chmod 644 "$MAINT_CONF"
+}
+
 action_maint_menu() {
-    ui_title "Maintenance — RAM cache & log cleanup"
-    bash "$SCRIPT_DIR/lib/maintain.sh" --status
-    echo
-    info "1) Run maintenance now"
-    info "2) Go back"
-    prompt "Choice: "
-    read -r c
-    case "$c" in
-        1)
-            need_root
-            info "Clearing RAM cache and cleaning logs..."
-            MAINT_CLEAR_SWAP="${MAINT_CLEAR_SWAP:-0}" bash "$SCRIPT_DIR/lib/maintain.sh" --run
-            ;;
-    esac
+    while :; do
+        ui_menu "Maintenance — RAM cache & log cleanup" \
+            "▶️  Run maintenance now" \
+            "🔄 Toggle swap clear (advanced — off by default)" \
+            "🗑️  Set journal size cap (current: ${MAINT_JOURNAL_MAX:-200M})" \
+            "📅 Set journal age cap (current: ${MAINT_JOURNAL_MAX_TIME:-7d})" \
+            "➕ Add a log file to the skip list" \
+            "➖ Remove a file from the skip list" \
+            "🚪 Back"
+        local c="$MENU_IDX"
+        case "$c" in
+            1)
+                need_root
+                info "Clearing RAM cache and cleaning logs..."
+                load_maint_env; bash "$SCRIPT_DIR/lib/maintain.sh" --run
+                ui_press_any_key ;;
+            2)
+                need_root
+                load_maint_env
+                if [ "${MAINT_CLEAR_SWAP:-0}" = "1" ]; then
+                    MAINT_CLEAR_SWAP=0
+                    warn "Swap clear disabled (recommended on a busy VPS)."
+                else
+                    if read_confirm "Enable swap clear? Risk: swapoff can trigger the OOM killer on a busy server. [y/N] " "n"; then
+                        MAINT_CLEAR_SWAP=1
+                        ok "Swap clear enabled."
+                    else
+                        MAINT_CLEAR_SWAP=0
+                        info "Left disabled."
+                    fi
+                fi
+                cfg_write_maint_conf; ui_press_any_key ;;
+            3)
+                need_root
+                load_maint_env
+                prompt "New journal size cap (e.g. 200M, 1G): "
+                read -r v
+                case "$v" in *[!0-9MGKmgk]*) warn "Invalid size." ;; '') info "Unchanged." ;; *) MAINT_JOURNAL_MAX="$v"; cfg_write_maint_conf; ok "Journal size cap set to $v." ;; esac
+                ui_press_any_key ;;
+            4)
+                need_root
+                load_maint_env
+                prompt "New journal age cap (e.g. 7d, 12h): "
+                read -r v
+                case "$v" in *[!0-9smhdSMHD]*) warn "Invalid timespan." ;; '') info "Unchanged." ;; *) MAINT_JOURNAL_MAX_TIME="$v"; cfg_write_maint_conf; ok "Journal age cap set to $v." ;; esac
+                ui_press_any_key ;;
+            5)
+                need_root
+                load_maint_env
+                prompt "Log file name to ALWAYS skip (e.g. app.log): "
+                read -r v
+                [ -z "$v" ] && { info "Cancelled."; ui_press_any_key; continue; }
+                case ",$MAINT_EXCLUDE," in *",$v,"*) info "Already skipped." ;; *) MAINT_EXCLUDE="${MAINT_EXCLUDE:+$MAINT_EXCLUDE,}$v"; cfg_write_maint_conf; ok "$v added to the skip list." ;; esac
+                ui_press_any_key ;;
+            6)
+                need_root
+                load_maint_env
+                if [ -z "$MAINT_EXCLUDE" ]; then info "Skip list is empty."; ui_press_any_key; continue; fi
+                info "Current skip list: $MAINT_EXCLUDE"
+                prompt "File name to remove from the skip list (empty = cancel): "
+                read -r v
+                [ -z "$v" ] && { info "Cancelled."; ui_press_any_key; continue; }
+                local out="" e
+                local IFS=','
+                for e in $MAINT_EXCLUDE; do
+                    [ "$e" = "$v" ] && continue
+                    out="${out:+$out,}$e"
+                done
+                MAINT_EXCLUDE="$out"
+                cfg_write_maint_conf
+                ok "Updated skip list: ${MAINT_EXCLUDE:-(empty)}."
+                ui_press_any_key ;;
+            0|7) return 0 ;;
+        esac
+    done
+}
+
+# Load /etc/vps-security/maintain.conf (if present) into the env for
+# direct CLI runs, mirroring the systemd unit's EnvironmentFile.
+load_maint_env() {
+    [ -f "$MAINT_CONF" ] && . "$MAINT_CONF"
+    return 0
 }
 
 cmd_maint() {
     case "${1:-status}" in
-        run)    need_root; MAINT_CLEAR_SWAP="${MAINT_CLEAR_SWAP:-0}" bash "$SCRIPT_DIR/lib/maintain.sh" --run ;;
-        status) bash "$SCRIPT_DIR/lib/maintain.sh" --status ;;
-        *)      bash "$SCRIPT_DIR/lib/maintain.sh" --status ;;
+        run)    need_root; load_maint_env; bash "$SCRIPT_DIR/lib/maintain.sh" --run ;;
+        status) load_maint_env; bash "$SCRIPT_DIR/lib/maintain.sh" --status ;;
+        *)      load_maint_env; bash "$SCRIPT_DIR/lib/maintain.sh" --status ;;
     esac
 }
 

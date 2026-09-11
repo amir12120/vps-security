@@ -320,7 +320,7 @@ check "empty-ports install removes stale allow-list" "[ ! -f '$VPSSEC_CONF_DIR/a
 
 echo
 echo "=== smoke: help & version ==="
-bash "$HERE/vpssec" version | grep -q 'vpssec 1.3.1' && R=0 || R=1
+bash "$HERE/vpssec" version | grep -q 'vpssec 1.3.2' && R=0 || R=1
 check "version reports 1.3.0"           "[ \"$R\" -eq 0 ]"
 bash "$HERE/vpssec" help | grep -q 'update' && R=0 || R=1
 check "help mentions update"            "[ \"$R\" -eq 0 ]"
@@ -519,6 +519,22 @@ check "maint logged to maintain.log"       "grep -q 'maintenance finished' '$VPS
 bash "$HERE/lib/maintain.sh" --status > "$SANDBOX/maintstat.out" 2>&1 || true
 check "maint status shows state"           "grep -q 'Maintenance' '$SANDBOX/maintstat.out'"
 check "vpssec maint status works"          "bash '$HERE/vpssec' maint status 2>&1 | grep -q 'Maintenance'"
+# safety: vps-security's own logs, the MAINT_EXCLUDE list and subdirs survive
+mkdir -p "$LOGDIR/nginx"
+printf 'audit' > "$LOGDIR/monitor.log"
+printf 'app'   > "$LOGDIR/app.log"
+printf 'site'  > "$LOGDIR/nginx/access.log"
+MAINT_LOG_DIR="$LOGDIR" MAINT_VACUUM_JOURNAL=0 MAINT_EXCLUDE="app.log" \
+    bash "$HERE/lib/maintain.sh" --run > /dev/null 2>&1 || true
+MON_KEEP=$(wc -c < "$LOGDIR/monitor.log")
+APP_KEEP=$(wc -c < "$LOGDIR/app.log")
+NGX_KEEP=$(wc -c < "$LOGDIR/nginx/access.log")
+check "maint protects vps-security logs"  "[ '$MON_KEEP' -eq 5 ]"
+check "maint honors MAINT_EXCLUDE"        "[ '$APP_KEEP' -eq 3 ]"
+check "maint skips subdirectories"        "[ '$NGX_KEEP' -eq 4 ]"
+# unit content checks target the generator (units are removed by the uninstall test above)
+check "maint unit uses EnvironmentFile"   "grep -q 'EnvironmentFile=-' '$HERE/vpssec' && grep -q 'maintain.conf' '$HERE/vpssec'"
+check "maint timer has startup jitter"    "grep -q 'RandomizedDelaySec' '$HERE/vpssec'"
 
 echo
 echo "=== smoke: Iranian mirror & DNS (GitHub speed criterion) ==="

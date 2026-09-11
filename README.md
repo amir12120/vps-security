@@ -11,7 +11,7 @@
 3. **Firewall (ufw)** — installs ufw, opens **only** the ports you approve and enables it. If you specify **no ports at all**, the firewall is left **disabled** and the server stays open on every port
 4. **Rogue-port monitor** — every 30 minutes scans live connections; any port **not** in your allow-list that is actively transferring data gets **blocked via ufw for 1 hour**, then automatically released
 5. **Bot & Scanner Shield** — per-IP connection rate limits, TCP-flag scan drops (NULL / SYN+FIN / SYN+RST / ALL), and auto-ban of SYN-flooding IPs for one hour
-6. **Maintenance** — every 2 days clears the RAM cache (`drop_caches`), removes rotated logs, truncates the usual active logs, and vacuums the systemd journal. Optional swap clear is **off by default**; enable it in `lib/maintain.sh` via `MAINT_CLEAR_SWAP=1`
+6. **Maintenance** — every 2 days clears the RAM cache (`drop_caches`), removes rotated logs, truncates active system logs, and vacuums the systemd journal (size **and** age capped). Optional swap clear is **off by default**; toggle it from the Maintenance menu or `MAINT_CLEAR_SWAP=1` in `/etc/vps-security/maintain.conf`. vps-security's own logs and any directory under `/var/log` are never touched, and you can exclude extra files via the menu or `MAINT_EXCLUDE`
 7. **GeoIP country filter** — allow **any number of countries** you choose (e.g. only Iran and Germany) and block every other country from reaching the server
 
 ---
@@ -66,6 +66,7 @@ Navigate with **↑/↓** (or `j`/`k`), select with **Enter**, go back with **q*
 | `sudo vpssec update` | Update vps-security from GitHub |
 | `sudo vpssec maint run` | Run the RAM-cache & log cleanup right now |
 | `sudo vpssec maint status` | Maintenance timer state + recent runs |
+| `sudo vpssec maint` | Maintenance menu: run now, toggle swap clear, journal caps, skip list |
 | `sudo vpssec shield status` | Bot & Scanner Shield state + banned IPs |
 | `sudo vpssec geo list` | GeoIP filter configuration |
 | `sudo vpssec mirror` | **The best Iranian mirror & DNS:** times every Iranian GitHub mirror and public DNS from this server, installs the fastest mirror system-wide and switches DNS — criterion: GitHub access speed |
@@ -92,6 +93,19 @@ On Iranian servers, GitHub is often slow or unreachable. The **🏁 The best Ira
 - All actions are logged to `/var/lib/vps-security/port-blocks.log` and `/var/lib/vps-security/monitor.log`.
 
 > **Note:** the scanner sees ports with live connections. A port that only *listens* without transferring data is not flagged — this keeps the tool safe around services that legitimately listen (docker proxies, panel sockets, …).
+
+## Maintenance details
+
+The maintenance timer runs every 2 days (with up to 15 minutes of random startup jitter so servers don't all clean at once).
+
+| Setting (`/etc/vps-security/maintain.conf`) | Default | Purpose |
+|---|---|---|
+| `MAINT_CLEAR_SWAP` | `0` | `swapoff/swapon` cycle — risky on busy VPS (OOM killer), keep off |
+| `MAINT_JOURNAL_MAX` | `200M` | journald size cap (`--vacuum-size`) |
+| `MAINT_JOURNAL_MAX_TIME` | `7d` | journald age cap (`--vacuum-time`) |
+| `MAINT_EXCLUDE` | — | extra top-level `/var/log` files to never touch, comma-separated |
+
+Everything is editable from the 🧹 **Maintenance** menu too (`vpssec maint`).
 
 ## Bot & Scanner Shield
 
