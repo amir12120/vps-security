@@ -8,7 +8,7 @@
 
 1. **System update** — runs `apt update && apt upgrade -y`
 2. **SSH port change** — moves SSH off port 22 to a port you choose (with automatic rollback if sshd fails to come back)
-3. **Firewall (ufw)** — installs ufw, opens **only** the ports you approve and enables it. If you specify **no ports at all**, the firewall is left **disabled** and the server stays open on every port
+3. **Firewall (ufw)** — installs ufw, opens **only** the ports you approve and enables it. You type the whole list in **one comma-separated answer** (`444,2086,2098,2689`) — every port is opened. If you specify **no ports at all**, the firewall is left **disabled** and the server stays open on every port
 4. **Rogue-port monitor** — every 30 minutes scans live connections; any port **not** in your allow-list that is actively transferring data gets **blocked via ufw for 1 hour**, then automatically released
 5. **Bot & Scanner Shield** — per-IP connection rate limits, TCP-flag scan drops (NULL / SYN+FIN / SYN+RST / ALL), and auto-ban of SYN-flooding IPs for one hour
 6. **Maintenance** — every 2 days clears the RAM cache (`drop_caches`), removes rotated logs, truncates active system logs, and vacuums the systemd journal (size **and** age capped). Optional swap clear is **off by default**; toggle it from the Maintenance menu or `MAINT_CLEAR_SWAP=1` in `/etc/vps-security/maintain.conf`. vps-security's own logs and any directory under `/var/log` are never touched, and you can exclude extra files via the menu or `MAINT_EXCLUDE`
@@ -31,7 +31,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.3.4 — server hardening toolkit
+  vps-security v1.4.0 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────
@@ -133,7 +133,7 @@ Enable it from the **🛡️ Bot & Scanner Shield** menu (or `vpssec shield enab
 - **Rate limiting** — ufw `limit` rules on SSH and every protected port: more than **6 new connections per 30 s** from one IP are dropped (this kills port scanners and brute-force bots). **Tunnel ports are excluded** — declare them with `vpssec tunnels add`.
 - **Ban safety** — IPs are never banned for loopback, private/CGNAT/link-local addresses, or peers on your GeoIP *never block* list; skips are logged.
 - **TCP-flag drops** — NULL scans, SYN+FIN, SYN+RST, and ALL-flags packets are dropped in ufw's `before.rules` (survives reboots and ufw reloads)
-- **Auto-ban** — an IP flooding a protected port with half-open connections (40+ SYN-RECV) is banned via `ufw deny from <ip>` for **one hour**; bans expire automatically (10-minute maintenance timer)
+- **Auto-ban** — an IP flooding a protected port with half-open connections (40+ SYN-RECV) is banned via `ufw deny from <ip>` for **one hour**; bans expire automatically (10-minute maintenance timer). Your **SSH port is always included** in the scan, so SSH brute-force floods are banned too — while declared **tunnel ports are never rate-limited and never banned** (one busy tunnel peer would otherwise look like a flood)
 - Manage banned IPs from the same menu: view the list with remaining time, or unban any IP instantly
 
 ## GeoIP country filter
@@ -209,6 +209,19 @@ It stays local-only by default — do not expose it publicly without an authenti
 
 - Ubuntu 20.04+ / Debian 11+ (uses `ss`, `ufw`, `systemd`, `python3` for the guard API, `ipset` for the GeoIP filter — auto-installed when needed)
 - root access
+
+## Tests
+
+Nothing here touches the machine it runs on: `ufw`, `ss`, `systemctl`, `apt-get`, `ipset` and `curl` are `PATH`-stubbed and every path is redirected into a temp sandbox.
+
+```bash
+bash test/smoke.sh              # 195 checks: full install, monitor, block expiry, shield, GeoIP, maintenance, mirror/DNS, symlinked CLI, uninstall
+bash test/simulate-two-host.sh  #  59 checks: two simulated servers (Iran + foreign) with a 3x-ui panel and a backpack tunnel
+```
+
+The two-host simulation models the real deployment — a foreign server running the 3x-ui/Sanayi panel (`2087` API, `2096` subscriptions) and a backpack **tunnel server** on `8443`, plus an Iran server with the tunnel **client** on `443` dialling out to it and reaching the panel over `127.0.0.1:2087`. It installs vps-security on **both** hosts, then proves the security stack never breaks the tunnel: tunnel and panel ports are opened and never blocked or rate-limited, outbound tunnel sockets and loopback forwards are ignored, **real rogue ports are still blocked**, GeoIP drops NEW connections only, a re-install adopts the tunnel rules instead of cutting them, and uninstalling on Iran leaves the foreign server untouched.
+
+Both suites run automatically in **GitHub Actions** on every push (`.github/workflows/deploy-smoke-test.yml`).
 
 ## Roadmap
 

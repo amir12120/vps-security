@@ -67,7 +67,7 @@ fi
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.3.5"
+VERSION="1.4.0"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
 REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
 REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"
@@ -494,26 +494,22 @@ _install_guided() {
         info "If any of these is a tunnel, VPN or panel port, keep it open below."
     fi
 
-    info "Enter the ports to keep open, one per line. Empty line = finish."
+    info "Enter ALL the ports to keep open at once, comma-separated."
+    info "  Example:  444,2086,2098,2689     (blank = no extra ports)"
     info "SSH port $current_port is added automatically."
     grep -qx "$current_port" "$ALLOWED_PORTS_CONF" || echo "$current_port" >> "$ALLOWED_PORTS_CONF"
 
-    local p
-    while :; do
-        prompt "  Port (blank to finish): "
-        read -r p
-        [ -z "$p" ] && break
-        if ! is_valid_port "$p"; then
-            warn "Invalid port."
-            continue
-        fi
+    local p_in p
+    prompt "  Open ports: "
+    read -r p_in || true
+    while IFS= read -r p; do
         if grep -qx "$p" "$ALLOWED_PORTS_CONF" 2>/dev/null; then
             info "  $p is already in the list."
             continue
         fi
         echo "$p" >> "$ALLOWED_PORTS_CONF"
         ok "  $p added."
-    done
+    done < <(parse_port_csv "${p_in:-}")
 
     # ----------------------------------------------------------------
     # Tunnel / proxy ports: opened in the firewall like any allowed port,
@@ -825,22 +821,33 @@ cmd_status() {
 action_port_add() {
     ensure_dirs
     touch "$ALLOWED_PORTS_CONF"
-    local p sp
-    p="$(read_port "Port to open (e.g. 443)" "")"
+    local sp p added=0
     sp="$(ssh_port_in_config 2>/dev/null || echo 22)"
-    if [ "$p" = "$sp" ]; then
-        info "Port $p is the current SSH port — it is always open."
-    fi
-    if grep -qx "$p" "$ALLOWED_PORTS_CONF" 2>/dev/null; then
-        info "Port $p is already in the allowed list."
+    info "Type every port you want open at once, comma-separated."
+    prompt "Ports to open (e.g. 444,2086,2098,2689): "
+    read -r raw_in || true
+    if [ -z "${raw_in:-}" ]; then
+        info "No ports entered — nothing changed."
         return 0
     fi
-    echo "$p" >> "$ALLOWED_PORTS_CONF"
-    if command -v ufw >/dev/null 2>&1; then
-        ufw allow "$p"/tcp >/dev/null 2>&1
-        ufw allow "$p"/udp >/dev/null 2>&1
-    fi
-    ok "Port $p is now open (allowed + ufw rule)."
+    while IFS= read -r p; do
+        if [ "$p" = "$sp" ]; then
+            info "Port $p is the current SSH port — it is always open."
+        fi
+        if grep -qx "$p" "$ALLOWED_PORTS_CONF" 2>/dev/null; then
+            info "Port $p is already in the allowed list."
+            continue
+        fi
+        echo "$p" >> "$ALLOWED_PORTS_CONF"
+        if command -v ufw >/dev/null 2>&1; then
+            ufw allow "$p"/tcp >/dev/null 2>&1
+            ufw allow "$p"/udp >/dev/null 2>&1
+        fi
+        ok "Port $p is now open (allowed + ufw rule)."
+        added=$((added + 1))
+    done < <(parse_port_csv "$raw_in")
+    [ "$added" -eq 0 ] && warn "Nothing was added — no valid new port in that input."
+    return 0
 }
 
 action_port_remove() {
@@ -883,7 +890,7 @@ action_port_remove() {
 action_ports_menu() {
     while :; do
         ui_menu "Ports — Manage Allowed Ports" \
-            "➕ Add an allowed port (open)" \
+            "➕ Add allowed ports — comma-separated (open)" \
             "➖ Remove an allowed port (close)" \
             "📋 Show allowed ports list" \
             "🚇 Tunnel ports (never blocked / never rate-limited)" 

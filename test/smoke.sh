@@ -194,9 +194,10 @@ EOF
 chmod +x "$STUBS/cp"
 
 echo "=== smoke: full guided install (piped answers) ==="
-# answers: update=y, ssh-port=2222, close-old=y, ports 443 8443, end,
+# answers: update=y, ssh-port=2222, close-old=y, ports only="443,8443",
 #          tunnels=n, guard-port=18080, open-guard=n, first-scan=n
-printf 'y\n2222\ny\n443\n8443\n\nn\n18080\nn\nn\n' \
+# The open ports are collected in ONE comma-separated answer.
+printf 'y\n2222\ny\n443,8443\nn\n18080\nn\nn\n' \
     | UFW_LOG="$SANDBOX/ufw.log" APT_LOG="$SANDBOX/apt.log" SYSTEMCTL_LOG="$SANDBOX/systemctl.log" \
       bash "$HERE/vpssec" install > "$SANDBOX/install.out" 2>&1
 grep -E '✓|✗|error|Error|denied' "$SANDBOX/install.out" | tail -n 20 || true
@@ -423,7 +424,7 @@ echo "=== smoke: install adopts the admin's existing ufw rules ==="
 # ufw --force reset the installer performs.
 printf '7777/tcp                   ALLOW       Anywhere\n' > "$SANDBOX/ufw-pre.txt"
 rm -f "$VPSSEC_CONF_DIR/allowed-ports.list" "$SANDBOX/ufw.log"
-printf 'n\n\nn\n18080\nn\nn\nn\n' \
+printf 'n\n\n\nn\n18080\nn\nn\n' \
     | UFW_STATUS_EXTRA="$SANDBOX/ufw-pre.txt" UFW_LOG="$SANDBOX/ufw.log" \
       SYSTEMCTL_LOG="$SANDBOX/systemctl.log" \
       bash "$HERE/vpssec" install > "$SANDBOX/install3.out" 2>&1 || true
@@ -431,6 +432,42 @@ check "install announces adopted ports"  "grep -q 'already open in ufw' '$SANDBO
 check "adopted port kept in allow-list"   "grep -qx '7777' '$VPSSEC_CONF_DIR/allowed-ports.list'"
 check "adopted port re-opened after reset" "grep -q 'allow 7777/tcp' '$SANDBOX/ufw.log'"
 check "install hints at listening services" "grep -q 'Services listening right now' '$SANDBOX/install3.out'"
+
+echo
+echo "=== smoke: install opens EVERY port from one comma-separated answer ==="
+# The admin types one line (444,2086,2098,2689) instead of one port per
+# prompt; all four must end up open and in the allow-list.
+rm -f "$VPSSEC_CONF_DIR/allowed-ports.list" "$VPSSEC_CONF_DIR/monitor.conf"
+rm -f "$SANDBOX/ufw.log"
+printf 'n\n\n444,2086,2098,2689\nn\n18080\nn\nn\n' \
+    | UFW_LOG="$SANDBOX/ufw.log" SYSTEMCTL_LOG="$SANDBOX/systemctl.log" \
+      bash "$HERE/vpssec" install > "$SANDBOX/install4.out" 2>&1 || true
+for _p in 444 2086 2098 2689; do
+    check "comma list: ufw opened $_p/tcp" "grep -q 'allow $_p/tcp' '$SANDBOX/ufw.log'"
+done
+check "comma list: all four in the allow-list" \
+    "for x in 444 2086 2098 2689; do grep -qx \"\$x\" '$VPSSEC_CONF_DIR/allowed-ports.list' || exit 1; done"
+check "comma list: firewall enabled"          "grep -q ' enable' '$SANDBOX/ufw.log'"
+
+# A junk token in the middle of the list must not cost the good ports.
+rm -f "$VPSSEC_CONF_DIR/allowed-ports.list" "$SANDBOX/ufw2.log"
+printf 'n\n\n444,notaport,70000\nn\n18080\nn\nn\n' \
+    | UFW_LOG="$SANDBOX/ufw2.log" SYSTEMCTL_LOG="$SANDBOX/systemctl.log" \
+      bash "$HERE/vpssec" install > "$SANDBOX/install5.out" 2>&1 || true
+check "comma list: good port still opened"  "grep -q 'allow 444/tcp' '$SANDBOX/ufw2.log'"
+check "comma list: bad name reported"       "grep -q 'Ignoring invalid port: notaport' '$SANDBOX/install5.out'"
+check "comma list: out-of-range reported"   "grep -q 'Ignoring invalid port: 70000' '$SANDBOX/install5.out'"
+check "comma list: bad ports not opened"    "! grep -q 'allow 70000' '$SANDBOX/ufw2.log'"
+
+echo
+echo "=== smoke: Ports menu 'add' takes a whole comma-separated list ==="
+rm -f "$SANDBOX/ufw.log"
+printf '1\n9001,9002,notaport\n\n' \
+    | UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" ports > "$SANDBOX/portsadd.out" 2>&1 || true
+check "ports add opened 9001/tcp"      "grep -q 'allow 9001/tcp' '$SANDBOX/ufw.log'"
+check "ports add opened 9002/tcp"      "grep -q 'allow 9002/tcp' '$SANDBOX/ufw.log'"
+check "ports add listed both"          "grep -qx '9001' '$VPSSEC_CONF_DIR/allowed-ports.list' && grep -qx '9002' '$VPSSEC_CONF_DIR/allowed-ports.list'"
+check "ports add skipped the bad token" "grep -q 'Ignoring invalid port: notaport' '$SANDBOX/portsadd.out'"
 
 echo
 echo "=== smoke: CLI invoked through a symlink (bootstrap layout) ==="
@@ -452,9 +489,12 @@ fi
 echo
 echo "=== smoke: guided install ends in the TUI menu (pty) ==="
 if command -v script >/dev/null 2>&1; then
-    # answers: skip apt=n, keep SSH port=<blank>, no extra ports=<blank>,
-    # then q in the menu. VPSSEC_NO_MENU=0 re-enables the post-install menu.
-    printf 'n\n\n\nn\nq\n' | TERM=xterm VPSSEC_NO_MENU=0 timeout 60 \
+    # Start from a clean port list so the guided setup takes its short
+    # "no extra ports" path and the answers below map 1:1 onto the
+    # prompts: skip apt=n, keep SSH port=<blank>, no ports=<blank>,
+    # no tunnels=n, then q in the menu.
+    rm -f "$VPSSEC_CONF_DIR/allowed-ports.list" "$VPSSEC_CONF_DIR/tunnel-ports.list"
+    printf 'n\n\n\nn\n18080\nn\nq\n' | TERM=xterm VPSSEC_NO_MENU=0 timeout 60 \
         script -qec "bash '$HERE/vpssec' install" /dev/null > "$SANDBOX/ptymenu.out" 2>&1 || true
     # Only assert once the pty genuinely drove the run to completion;
     # otherwise this environment cannot host the test (skip, don't fail).

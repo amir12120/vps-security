@@ -38,6 +38,25 @@ is_valid_port() {
     [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
+# Split a comma / space separated port list into one valid port per line:
+#   while IFS= read -r p; do ... done < <(parse_port_csv "444,2086,2098")
+# Invalid tokens are reported on stderr and skipped, so a single prompt can
+# collect the whole list at once (444,2086,2098,2689) without losing ports.
+parse_port_csv() {
+    local raw="$1" tok
+    local -a toks=()
+    IFS=$' \t\n,;' read -ra toks <<< "$raw"
+    for tok in "${toks[@]:-}"; do
+        tok="$(printf '%s' "$tok" | tr -d '[:space:]')"
+        [ -z "$tok" ] && continue
+        if is_valid_port "$tok"; then
+            printf '%s\n' "$tok"
+        else
+            warn "Ignoring invalid port: $tok" >&2
+        fi
+    done
+}
+
 # State/config locations
 VPSSEC_CONF_DIR="${VPSSEC_CONF_DIR:-/etc/vps-security}"
 VPSSEC_STATE_DIR="${VPSSEC_STATE_DIR:-/var/lib/vps-security}"

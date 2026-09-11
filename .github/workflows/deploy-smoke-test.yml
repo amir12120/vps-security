@@ -16,13 +16,15 @@ jobs:
 
       - name: Shell syntax check (all scripts)
         run: |
-          bash -n install.sh
-          bash -n vpssec
-          bash -n lib/common.sh
-          bash -n lib/monitor.sh
-          bash -n lib/guard.sh
-          bash -n scripts/update.sh
-          bash -n test/smoke.sh
+          fail=0
+          for f in install.sh vpssec lib/*.sh scripts/*.sh test/*.sh; do
+            if bash -n "$f"; then
+              echo "ok   $f"
+            else
+              echo "FAIL $f"; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
           echo "all scripts pass bash -n"
 
       - name: ShellCheck (non-blocking)
@@ -35,3 +37,17 @@ jobs:
         run: |
           chmod +x vpssec lib/*.sh test/*.sh scripts/*.sh
           bash test/smoke.sh
+
+      - name: Run two-host tunnel simulation (Iran + foreign, panel + backpack)
+        run: |
+          bash test/simulate-two-host.sh
+
+      - name: Upload smoke logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: |
+            /tmp/*.txt
+            /tmp/*.out
+          if-no-files-found: ignore

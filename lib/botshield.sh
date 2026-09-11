@@ -55,13 +55,17 @@ EOF
     chmod 600 "$SHIELD_CONF"
 }
 
-# Protected ports: explicit list, else the allow-list minus SSH port
-# (SSH is handled separately below with its own limit).
+# Protected ports: explicit list, else the allow-list.
 #
 # TUNNEL PORTS ARE EXCLUDED: `ufw limit` drops a source after ~6 new
 # connections in 30s, and a busy tunnel means one peer IP opening exactly
 # that kind of burst — rate-limiting it would cut the tunnel for the
 # admin's own customers.
+#
+# The SSH PORT IS ALWAYS INCLUDED: brute-force floods aimed at SSH are the
+# most common bot traffic there is, so it must be bannable (it only gets a
+# `ufw limit` when the port is not in this list). It can never be a tunnel
+# port in practice, but if an admin declared it as one it is skipped too.
 shield_ports() {
     local ports="$1"
     local sp p out=""
@@ -71,7 +75,6 @@ shield_ports() {
         load_allowed_ports
         for p in "${ALLOWED_PORTS[@]:-}"; do
             [ -z "$p" ] && continue
-            [ "$p" = "$sp" ] && continue
             port_is_tunnel "$p" && continue
             out+="${out:+,}$p"
         done
@@ -79,10 +82,15 @@ shield_ports() {
         IFS=',' read -ra want <<< "$ports"
         for p in "${want[@]:-}"; do
             [ -z "$p" ] && continue
-            [ "$p" = "$sp" ] && continue
             port_is_tunnel "$p" && continue
             out+="${out:+,}$p"
         done
+    fi
+    if ! port_is_tunnel "$sp"; then
+        case ",$out," in
+            *",$sp,"*) ;;
+            *) out+="${out:+,}$sp" ;;
+        esac
     fi
     printf '%s' "$out"
 }
@@ -137,6 +145,7 @@ apply_limit_rules() {
     IFS=',' read -ra plist <<< "$ports_csv"
     for p in "${plist[@]:-}"; do
         [ -z "$p" ] && continue
+        [ "$p" = "$ssh_port" ] && continue   # already limited above
         port_is_tunnel "$p" && continue
         cmd_ufw limit "$p"/tcp >/dev/null 2>&1
         cmd_ufw limit "$p"/udp >/dev/null 2>&1
@@ -150,6 +159,7 @@ remove_limit_rules() {
     IFS=',' read -ra plist <<< "$ports_csv"
     for p in "${plist[@]:-}"; do
         [ -z "$p" ] && continue
+        [ "$p" = "$ssh_port" ] && continue
         port_is_tunnel "$p" && continue
         cmd_ufw delete limit "$p"/tcp >/dev/null 2>&1
         cmd_ufw delete limit "$p"/udp >/dev/null 2>&1
