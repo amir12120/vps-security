@@ -21,7 +21,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 GUARD_PORT="18080"
 GUARD_HOST="${GUARD_HOST:-127.0.0.1}"
-MAX_BODY_BYTES=8192
+# Reserved for future bash-side request body handling; the Python server
+# (cmd_serve_py) enforces its own limits.
+MAX_BODY_BYTES=8192  # shellcheck disable=SC2034 # intentionally kept
 
 json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' '
@@ -62,12 +64,13 @@ build_status_json() {
 
 serve_one() {
     # Read request headers (and discard any body)
+    # shellcheck disable=SC2034  # req/method parsed for clarity; routing uses path
     local req line method path
     IFS=' ' read -r method path _ <&"$1" 2>/dev/null || return 0
     # consume remaining headers
     while IFS= read -r line <&"$1" && [ "$line" != $'\r' ] && [ -n "$line" ]; do :; done
 
-    local body out
+    local out
     case "$path" in
         /health)
             out='{"status":"ok"}'

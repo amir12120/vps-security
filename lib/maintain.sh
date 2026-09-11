@@ -63,6 +63,8 @@ dir_bytes() {
 log_is_protected() {
     local f="$1" p
     for p in "${EXCLUDE_PATTERNS[@]}"; do
+        # SC2254 intentional: patterns ARE globs — that is how fnmatch works
+        # shellcheck disable=SC2254
         case "$f" in $p) return 0 ;; esac
     done
     if [ -n "$MAINT_EXCLUDE" ]; then

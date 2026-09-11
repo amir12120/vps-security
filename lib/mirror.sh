@@ -27,11 +27,12 @@
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
 MIRROR_CONF="$VPSSEC_CONF_DIR/mirror.conf"
 MIRROR_LOG="$VPSSEC_STATE_DIR/mirror.log"
-GIT_CONFIG_SYS="${VPSSEC_GITCONFIG:-/etc/gitconfig}"
+GIT_CONFIG_DIR_DEFAULT="/etc"
 RESOLVED_CONF_D="${VPSSEC_RESOLVED_CONF_D:-/etc/systemd/resolved.conf.d}"
 RESOLV_CONF="${VPSSEC_RESOLV_CONF:-/etc/resolv.conf}"
 PROBE_REPO="${MIRROR_PROBE_REPO:-octocat/Hello-World}"

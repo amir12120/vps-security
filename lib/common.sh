@@ -5,6 +5,7 @@
 
 # Colors (disabled when not a TTY)
 if [ -t 1 ]; then
+    # shellcheck disable=SC2034  # BOLD/DIM are consumed by vpssec's TUI which sources this file
     RED='\033[0;31m'
     GREEN='\033[0;32m'
     YELLOW='\033[1;33m'
@@ -43,7 +44,8 @@ VPSSEC_STATE_DIR="${VPSSEC_STATE_DIR:-/var/lib/vps-security}"
 VPSSEC_SYSTEMD_DIR="${VPSSEC_SYSTEMD_DIR:-/etc/systemd/system}"
 # Where generated ufw 'before' rules live (overridable for sandbox tests)
 UFW_DIR="${UFW_DIR:-/etc/ufw}"
-MONITOR_CONF="$VPSSEC_CONF_DIR/monitor.conf"
+# Path overridable for sandbox tests; consumed by lib/monitor.sh (and vpssec)
+MONITOR_CONF="$VPSSEC_CONF_DIR/monitor.conf"  # shellcheck disable=SC2034
 ALLOWED_PORTS_CONF="$VPSSEC_CONF_DIR/allowed-ports.list"
 BLOCK_LIST_FILE="$VPSSEC_STATE_DIR/blocked-ports.list"
 BLOCK_LOG="$VPSSEC_STATE_DIR/port-blocks.log"
