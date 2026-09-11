@@ -49,6 +49,8 @@ export VPSSEC_SKIP_OS_CHECK=1
 # Never let a test run block on the post-install TUI menu (the pty section
 # below re-enables it explicitly with VPSSEC_NO_MENU=0).
 export VPSSEC_NO_MENU=1
+# Single source of truth for the version assertions
+VER="$(grep -m1 '^VERSION=' "$HERE/vpssec" | cut -d'"' -f2)"
 export PATH="$STUBS:$PATH"
 SSH_CFG="$SANDBOX/etc-ssh/sshd_config"
 trap 'rm -rf "$SANDBOX"' EXIT
@@ -439,7 +441,7 @@ LINK_DIR="$SANDBOX/bin"
 mkdir -p "$LINK_DIR"
 if ln -s "$HERE/vpssec" "$LINK_DIR/vpssec" 2>/dev/null && [ -L "$LINK_DIR/vpssec" ]; then
     printf '0\n' | bash "$LINK_DIR/vpssec" > "$SANDBOX/linkmenu.out" 2>&1 || true
-    bash "$LINK_DIR/vpssec" version | grep -q 'vpssec 1.3.5' && R=0 || R=1
+    bash "$LINK_DIR/vpssec" version | grep -q "vpssec $VER" && R=0 || R=1
     check "symlinked CLI loads its libraries"  "[ \"$R\" -eq 0 ]"
     check "symlinked CLI draws the menu"       "grep -q 'Main Menu' '$SANDBOX/linkmenu.out'"
     check "symlinked CLI reports no load error" "! grep -q 'unbound variable\|No such file' '$SANDBOX/linkmenu.out'"
@@ -457,6 +459,10 @@ if command -v script >/dev/null 2>&1; then
     # Only assert once the pty genuinely drove the run to completion;
     # otherwise this environment cannot host the test (skip, don't fail).
     if grep -q 'guided setup' "$SANDBOX/ptymenu.out" && grep -q 'SSH port unchanged' "$SANDBOX/ptymenu.out"; then
+        if ! grep -q 'Main Menu' "$SANDBOX/ptymenu.out"; then
+            echo "--- ptymenu.out (last 25 lines) ---"
+            tail -n 25 "$SANDBOX/ptymenu.out" | cat -v
+        fi
         check "setup finishes and enters the menu"  "grep -q 'Setup finished' '$SANDBOX/ptymenu.out'"
         check "install opens the menu on a terminal" "grep -q 'Main Menu' '$SANDBOX/ptymenu.out'"
     else
@@ -468,8 +474,8 @@ fi
 
 echo
 echo "=== smoke: help & version ==="
-bash "$HERE/vpssec" version | grep -q 'vpssec 1.3.5' && R=0 || R=1
-check "version reports 1.3.3"           "[ \"$R\" -eq 0 ]"
+bash "$HERE/vpssec" version | grep -q "vpssec $VER" && R=0 || R=1
+check "version reports $VER"            "[ \"$R\" -eq 0 ]"
 bash "$HERE/vpssec" help | grep -q 'update' && R=0 || R=1
 check "help mentions update"            "[ \"$R\" -eq 0 ]"
 
