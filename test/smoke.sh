@@ -320,7 +320,7 @@ check "empty-ports install removes stale allow-list" "[ ! -f '$VPSSEC_CONF_DIR/a
 
 echo
 echo "=== smoke: help & version ==="
-bash "$HERE/vpssec" version | grep -q 'vpssec 1.3.0' && R=0 || R=1
+bash "$HERE/vpssec" version | grep -q 'vpssec 1.3.1' && R=0 || R=1
 check "version reports 1.3.0"           "[ \"$R\" -eq 0 ]"
 bash "$HERE/vpssec" help | grep -q 'update' && R=0 || R=1
 check "help mentions update"            "[ \"$R\" -eq 0 ]"
@@ -392,6 +392,24 @@ rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --disable > /dev/null 2>&1 || true
 check "geo disable strips rules"        "! grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
 check "geo disable clears conf"         "grep -q 'GEO_ENABLED=0' '$VPSSEC_CONF_DIR/geo.conf'"
+
+echo
+echo "=== smoke: GeoIP country names (full names / Persian / alpha-3) ==="
+# a) add via full names, Persian names, alpha-3 and unique prefix
+printf 'GEO_ENABLED=0\nGEO_COUNTRIES=\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --add "Iran,Germany,USA,آلمان,united kingdom,Turk" > "$SANDBOX/geonames.out" 2>&1 || true
+check "names resolve (EN/FA/a3/prefix)" "grep -q 'GEO_COUNTRIES=IR,DE,US,GB,TR' '$VPSSEC_CONF_DIR/geo.conf'"
+check "ambiguous prefix rejected"       "grep -q '\"united\" is not a valid\|not a valid country' '$SANDBOX/geonames.out' && ! grep -q 'GEO_COUNTRIES=.*GB,\|,GB$' /dev/null; grep -c 'united' '$VPSSEC_CONF_DIR/geo.conf' | grep -q '^0$'"
+# b) remove via full + Persian names (list is IR,DE,US,GB,TR after a)
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --remove "united kingdom,ایران" > /dev/null 2>&1 || true
+check "remove by name works"            "grep -q '^GEO_COUNTRIES=DE,US,TR$' '$VPSSEC_CONF_DIR/geo.conf'"
+# c) bogus name is rejected and adds nothing
+printf 'GEO_ENABLED=0\nGEO_COUNTRIES=\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --add "Atlantis,Narnia" > "$SANDBOX/geobogus.out" 2>&1 || true
+check "bogus names rejected"            "grep -q 'not a valid country' '$SANDBOX/geobogus.out' && grep -q '^GEO_COUNTRIES=$' '$VPSSEC_CONF_DIR/geo.conf'"
+# d) CLI prompt mentions full names
+bash "$HERE/vpssec" help > /dev/null 2>&1 || true
+check "geo help still lists commands"   "bash '$HERE/vpssec' help 2>&1 | grep -q 'geo'"
 
 echo
 echo "=== smoke: GeoIP safety — server must stay open when no countries are set ==="

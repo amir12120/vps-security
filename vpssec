@@ -16,6 +16,8 @@
 #   update       Update vps-security from GitHub
 #   maint        RAM cache & log cleanup (run / status)
 #   mirror       Best Iranian mirror & DNS (best / test / reset / status)
+#   shield       Bot & Scanner Shield (enable / disable / status)
+#   geo          Country filter (add / remove / list / enable / disable / bypass / refresh)
 #   logs         Show monitor log
 #   uninstall    Remove vps-security completely
 #   help         Show this help
@@ -30,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
 REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
 REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"
@@ -1127,9 +1129,9 @@ cmd_mirror() {
 
 action_geo_add() {
     ui_title "Add Allowed Countries"
-    info "Enter 2-letter country codes, comma-separated."
-    info "Examples: IR (Iran), DE (Germany), US, TR, AE — as many as you want."
-    prompt "Countries (e.g. IR,DE): "
+    info "Enter country codes or full country names, comma-separated."
+    info "Examples: IR, Germany, ایران, USA, Turkey — as many as you want."
+    prompt "Countries (e.g. IR,DE or Iran,Germany): "
     read -r ccs
     [ -z "$ccs" ] && { info "Cancelled."; return 0; }
     bash "$SCRIPT_DIR/lib/geoip.sh" --add "$ccs"
@@ -1138,7 +1140,8 @@ action_geo_add() {
 action_geo_remove() {
     ui_title "Remove Allowed Countries"
     bash "$SCRIPT_DIR/lib/geoip.sh" --list
-    prompt "Country codes to remove (e.g. TR): "
+    info "Country codes or full names both work (e.g. TR or Turkey)."
+    prompt "Countries to remove: "
     read -r ccs
     [ -z "$ccs" ] && { info "Cancelled."; return 0; }
     bash "$SCRIPT_DIR/lib/geoip.sh" --remove "$ccs"

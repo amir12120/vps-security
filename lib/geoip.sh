@@ -70,19 +70,112 @@ valid_cc() { printf '%s' "$1" | grep -qE '^[A-Za-z]{2}$'; }
 
 norm_cc() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
 
+# ---------- country name resolution ----------
+# Lets users type full country names (English or Persian), ISO alpha-3
+# codes (USA), or unique name prefixes instead of remembering 2-letter
+# ISO codes. Table: CODE|A3|english|alias1|alias2... (aliases may be
+# English or Persian; everything space-stripped, English lowercase).
+CC_TABLE=(
+"IR|IRN|iran|ایران"
+"DE|DEU|germany|آلمان"
+"US|USA|unitedstates|america|usa|امریکا|آمریکا"
+"GB|GBR|unitedkingdom|uk|britain|england|انگلستان|بریتانیا"
+"TR|TUR|turkey|turkiye|ترکیه"
+"AE|ARE|unitedarabemirates|uae|dubai|امارات"
+"NL|NLD|netherlands|holland|هلند"
+"FR|FRA|france|فرانسه"
+"CA|CAN|canada|کانادا"
+"RU|RUS|russia|روسیه"
+"CN|CHN|china|چین"
+"JP|JPN|japan|ژاپن"
+"KR|KOR|southkorea|korea|کره"
+"IN|IND|india|هند"
+"IQ|IRQ|iraq|عراق"
+"AF|AFG|afghanistan|افغانستان"
+"PK|PAK|pakistan|پاکستان"
+"AZ|AZE|azerbaijan|آذربایجان"
+"AM|ARM|armenia|ارمنستان"
+"IT|ITA|italy|ایتالیا"
+"ES|ESP|spain|اسپانیا"
+"SE|SWE|sweden|سوئد"
+"NO|NOR|norway|نروژ"
+"FI|FIN|finland|فنلاند"
+"DK|DNK|denmark|دانمارک"
+"CH|CHE|switzerland|سوئیس|سویس"
+"AT|AUT|austria|اتریش"
+"BE|BEL|belgium|بلژیک"
+"PL|POL|poland|لهستان"
+"CZ|CZE|czechia|czechrepublic|چک"
+"RO|ROU|romania|رومانی"
+"GR|GRC|greece|یونان"
+"SA|SAU|saudiarabia|arabia|عربستان"
+"QA|QAT|qatar|قطر"
+"KW|KWT|kuwait|کویت"
+"OM|OMN|oman|عمان"
+"BH|BHR|bahrain|بحرین"
+"JO|JOR|jordan|اردن"
+"LB|LBN|lebanon|لبنان"
+"EG|EGY|egypt|مصر"
+"MY|MYS|malaysia|مالزی"
+"ID|IDN|indonesia|اندونزی"
+"AU|AUS|australia|استرالیا|اوسترالیا"
+"UA|UKR|ukraine|اوکراین"
+"KZ|KAZ|kazakhstan|قزاقستان"
+"GE|GEO|georgia|گرجستان"
+"AR|ARG|argentina|آرژانتین"
+"BR|BRA|brazil|برزیل"
+)
+
+# resolve_cc <token> -> prints ISO alpha-2 code, or fails when unknown
+# Accepts: 2-letter code, alpha-3, exact English/Persian name, or a
+# UNIQUE prefix of the English name (e.g. "German" -> DE; "united" is
+# ambiguous and therefore rejected).
+resolve_cc() {
+    local in cc key entry code rest field found cnt
+    in="$(printf '%s' "$1" | tr -d '[:space:]')"
+    [ -z "$in" ] && return 1
+    cc="$(norm_cc "$in")"
+    if valid_cc "$cc"; then printf '%s\n' "$cc"; return 0; fi
+    key="$(printf '%s' "$in" | tr '[:upper:]' '[:lower:]')"
+    # pass 1: exact match on alpha-3 / English name / any alias
+    for entry in "${CC_TABLE[@]}"; do
+        code="${entry%%|*}"; rest="${entry#*|}"
+        if [ "$key" = "$(printf '%s' "${rest%%|*}" | tr '[:upper:]' '[:lower:]')" ]; then
+            printf '%s\n' "$code"; return 0
+        fi
+        rest="${rest#*|}"
+        local IFS='|'
+        for field in $rest; do
+            if [ "$key" = "$(printf '%s' "$field" | tr '[:upper:]' '[:lower:]')" ]; then
+                printf '%s\n' "$code"; return 0
+            fi
+        done
+    done
+    # pass 2: unique prefix of the English primary name
+    found=""; cnt=0
+    for entry in "${CC_TABLE[@]}"; do
+        code="${entry%%|*}"; rest="${entry#*|}"; rest="${rest#*|}"
+        case "${rest%%|*}" in
+            "$key"*) found="$code"; cnt=$((cnt + 1)) ;;
+        esac
+    done
+    if [ "$cnt" -eq 1 ]; then printf '%s\n' "$found"; return 0; fi
+    return 1
+}
+
 # ---------- country list management ----------
 
 geo_add_countries() {
-    local input="$1" added=() cc
+    local input="$1" added=() cc resolved
     load_geo_conf
     IFS=',' read -ra ccs <<< "$input"
     for cc in "${ccs[@]:-}"; do
-        cc="$(norm_cc "$(printf '%s' "$cc" | tr -d '[:space:]')")"
-        [ -z "$cc" ] && continue
-        if ! valid_cc "$cc"; then
-            warn "'$cc' is not a valid 2-letter country code (e.g. IR, DE)."
+        [ -z "$(printf '%s' "$cc" | tr -d '[:space:]')" ] && continue
+        if ! resolved="$(resolve_cc "$cc")"; then
+            warn "'$cc' is not a valid country code or name (e.g. IR, DE, Iran, Germany, ایران)."
             continue
         fi
+        cc="$resolved"
         case ",${GEO_COUNTRIES}," in
             *",$cc,"*) info "$cc already allowed." ;;
             *)
@@ -102,12 +195,16 @@ geo_add_countries() {
 }
 
 geo_remove_countries() {
-    local input="$1" out="" removed=() cc
+    local input="$1" out="" removed=() cc resolved
     load_geo_conf
     IFS=',' read -ra ccs <<< "$input"
     for cc in "${ccs[@]:-}"; do
-        cc="$(norm_cc "$(printf '%s' "$cc" | tr -d '[:space:]')")"
-        [ -z "$cc" ] && continue
+        [ -z "$(printf '%s' "$cc" | tr -d '[:space:]')" ] && continue
+        if ! resolved="$(resolve_cc "$cc")"; then
+            warn "'$cc' is not a valid country code or name — skipped."
+            continue
+        fi
+        cc="$resolved"
         case ",${GEO_COUNTRIES}," in
             *",$cc,"*)
                 removed+=("$cc")
