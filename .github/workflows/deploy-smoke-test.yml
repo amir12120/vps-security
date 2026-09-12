@@ -50,4 +50,5 @@ jobs:
           path: |
             /tmp/*.txt
             /tmp/*.out
+            /tmp/tmp.*/*.out
           if-no-files-found: ignore
