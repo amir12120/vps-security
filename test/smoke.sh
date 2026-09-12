@@ -319,7 +319,7 @@ PICK="$(bash "$HERE/lib/alerts.sh" --get 1 | cut -d'|' -f3)"
 rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" alerts approve 1 > "$SANDBOX/approve.out" 2>&1 || true
 check "approve blocks exactly that port"  "grep -q 'deny $PICK/tcp' '$SANDBOX/ufw.log'"
-check "approve records the block"         "grep -qE \"\\|$PICK\\$\" '$VPSSEC_STATE_DIR/blocked-ports.list'"
+check "approve records the block"         "grep -qE '\|$PICK$' '$VPSSEC_STATE_DIR/blocked-ports.list'"
 check "approve says how long the ban lasts" "grep -q 'blocked for 24h' '$SANDBOX/approve.out'"
 check "approve is logged"                 "grep -q 'APPROVED port $PICK' '$ALERT_LOG'"
 check "approved alert left the queue"     "[ \"$(alerts_count)\" -eq 1 ]"
@@ -333,7 +333,7 @@ check "dismiss is logged"                 "grep -q 'DISMISSED port' '$ALERT_LOG'
 # a rogue port that is now blocked must not come back as a new alert
 rm -f "$ALERTS_FILE"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --scan > /dev/null 2>&1
-check "already-punished port is not re-alerted" "! grep -qE "^[0-9]+\\|port\\|$PICK\\|" '$ALERTS_FILE'"
+check "already-punished port is not re-alerted" "! grep -qE '^[0-9]+\|port\|$PICK\|' '$ALERTS_FILE'"
 check "the other rogue port returns to the queue" "[ \"$(alerts_count)\" -eq 1 ]"
 rm -f "$ALERTS_FILE"
 
@@ -395,6 +395,21 @@ check "undeclared port is monitored again" "! grep -q 'deny 9999/tcp' '$SANDBOX/
 # the still-declared tunnel port stays protected
 check "remaining tunnel port still safe" "! grep -q 'deny 8443' '$SANDBOX/ufw.log'"
 bash "$HERE/vpssec" tunnels remove 8443 > /dev/null 2>&1 || true
+
+echo
+echo "=== smoke: suite self-lint ==="
+# Inside a check's double-quoted condition a regex must be SINGLE-quoted with a
+# single backslash-pipe. A doubled backslash survives one parse too many: eval
+# then treats the pattern as a pipeline, the command never runs, and a `! grep`
+# silently "passes". This lint keeps that class of false green out of the suite.
+RISKY_PATTERN='\\|'
+SELF_RISKY=$(grep -F "$RISKY_PATTERN" "$HERE/test/smoke.sh" 2>/dev/null | grep -c '^check ' || true)
+check "no double-escaped patterns in conditions" "[ \"${SELF_RISKY:-0}\" -eq 0 ]"
+RISKY_LIB=$(grep -F "$RISKY_PATTERN" "$HERE/test/simulate-two-host.sh" 2>/dev/null | grep -c '^check ' || true)
+check "no double-escaped patterns in the simulation" "[ \"${RISKY_LIB:-0}\" -eq 0 ]"
+
+# A condition that errors out is never a real result: fail loudly instead.
+check "eval'd conditions are valid shell" "bash -n '$HERE/test/smoke.sh'"
 
 echo
 echo "=== smoke: alert wording, country lookup and login notice ==="
@@ -1011,6 +1026,12 @@ mkdir -p "$MS/etc" "$MS/state"
 export VPSSEC_GITCONFIG="$MS/etc/gitconfig"
 export VPSSEC_RESOLV_CONF="$MS/etc/resolv.conf"
 export VPSSEC_RESOLVED_CONF_D="$MS/etc/resolved.d"
+# keep the apt side of --reset inside the sandbox too, so no code path in this
+# section can ever reach the real /etc/apt or /root
+mkdir -p "$MS/etc/sources.list.d" "$MS/aptbackup"
+export VPSSEC_APT_SOURCES_LIST="$MS/etc/sources.list"
+export VPSSEC_APT_SOURCES_D="$MS/etc/sources.list.d"
+export VPSSEC_APT_BACKUP_DIR="$MS/aptbackup"
 # stub curl: mirror #2 answers fastest, mirror #1 slow, mirror #3 broken,
 # direct github FAIL — ensures the winner logic picks iranserver
 cat > "$STUBS/curl" <<'MCEOF'
@@ -1069,9 +1090,122 @@ VPSSEC_CONF_DIR="$MS/etc" VPSSEC_STATE_DIR="$MS/state" VPSSEC_SKIP_ROOT_CHECK=1 
     bash "$HERE/vpssec" mirror status > "$MS/cli.out" 2>&1 || true
 check "vpssec mirror status works"       "grep -q 'Iranian mirror' '$MS/cli.out'"
 
-# menu shows the new entry
-printf '13\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menumirror.out" 2>&1 || true
-check "menu shows mirror entry"          "grep -q 'Iranian mirror & DNS' '$SANDBOX/menumirror.out'"
+# the main menu must actually OPEN the mirror submenu (assert on a string that
+# only exists inside it — asserting on the main-menu label passes trivially)
+printf '14\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menumirror.out" 2>&1 || true
+check "menu opens the mirror submenu"    "grep -q 'Fastest apt (package) mirror' '$SANDBOX/menumirror.out'"
+
+# --- 'mirror --test' must actually PRINT the speed tables -------------------
+# (regression: stdout was sent to /dev/null, which also swallowed the table,
+#  so menu option "test only" printed nothing at all)
+PATH="$STUBS:$PATH" VPSSEC_CONF_DIR="$MS/etc" VPSSEC_STATE_DIR="$MS/state" \
+    VPSSEC_SKIP_ROOT_CHECK=1 VPSSEC_SKIP_OS_CHECK=1 \
+    bash "$HERE/lib/mirror.sh" --test > "$MS/test.out" 2>&1 || true
+check "mirror --test prints GitHub table" "grep -q 'GitHub mirror speed test' '$MS/test.out'"
+check "mirror --test prints DNS table"    "grep -q 'Iranian DNS speed test' '$MS/test.out'"
+
+# --- DNS candidate list: deduped, wide, and named --------------------------
+PATH="$STUBS:$PATH" VPSSEC_CONF_DIR="$MS/etc" VPSSEC_STATE_DIR="$MS/state" \
+    bash -c '. "'"$HERE"'/lib/mirror.sh" --status >/dev/null 2>&1; dns_candidates' \
+    > "$MS/cand.out" 2>&1
+check "dns: candidates deduped"           "[ \"\$(cut -d'|' -f1 '$MS/cand.out' | sort | uniq -d | wc -l)\" -eq 0 ]"
+check "dns: wide Iranian resolver list"   "[ \"\$(wc -l < '$MS/cand.out')\" -ge 20 ]"
+check "dns: unnamed resolver falls back to IP" \
+    "grep -qE '^[0-9.]+\|\|[0-9.]+$' '$MS/cand.out'"
+
+# --- DNS lookup tool handling: nslookup fallback + a clear hint ------------
+# The DNS half needs dig or nslookup (same 'dnsutils' package). A minimal
+# server often has neither, and before this it silently reported "no DNS
+# answered" instead of telling the admin what to install.
+NT="$SANDBOX/notools"
+mkdir -p "$NT"
+cat > "$NT/nslookup" <<'NSEOF'
+#!/usr/bin/env bash
+echo "Server:\t\t10.202.10.202"
+echo "Address:\t10.202.10.202#53"
+echo "Name:\tgithub.com"
+echo "Address:\t140.82.121.4"
+exit 0
+NSEOF
+chmod +x "$NT/nslookup"
+PATH="$NT:/usr/bin:/bin" VPSSEC_DNS_TOOL=nslookup \
+    VPSSEC_CONF_DIR="$MS/etc" VPSSEC_STATE_DIR="$MS/state" \
+    bash -c '. "'"$HERE"'/lib/mirror.sh" --status >/dev/null 2>&1; dns_query_ms 10.202.10.202 github.com' \
+    > "$MS/nsq.out" 2>&1 || true
+check "dns: nslookup fallback returns a time" "grep -qE '^[0-9]+$' '$MS/nsq.out'"
+VPSSEC_DNS_TOOL=none VPSSEC_CONF_DIR="$MS/etc" VPSSEC_STATE_DIR="$MS/state" \
+    VPSSEC_SKIP_ROOT_CHECK=1 VPSSEC_SKIP_OS_CHECK=1 MIRROR_INSTALL_DEPS=0 \
+    bash "$HERE/lib/mirror.sh" --test > "$MS/notool.out" 2>&1 || true
+check "dns: missing tool gives a clear hint" \
+    "grep -q 'apt-get install -y dnsutils' '$MS/notool.out'"
+
+# --- apt mirror: speed test, apply, rollback, reset -------------------------
+# Raises the stakes of the same rule as the rest of the suite: nothing outside
+# the sandbox may be touched, so every path is redirected via VPSSEC_APT_* .
+AP="$SANDBOX/aptmirror"
+mkdir -p "$AP/etc" "$AP/state" "$AP/backup" "$AP/apt/etc/apt/sources.list.d"
+printf 'Types: deb\nURIs: http://archive.ubuntu.com/ubuntu\nSuites: jammy\nComponents: main\n' \
+    > "$AP/apt/etc/apt/sources.list.d/ubuntu.sources"
+cat > "$STUBS/curl" <<'APTCURL'
+#!/usr/bin/env bash
+url=""
+for a in "$@"; do case "$a" in http*) url="$a";; esac; done
+case "$url" in
+    *pishgaman*)      echo "200 524288.0" ;;   # 512 KB/s -> winner
+    *arvancloud*)     echo "200 262144.0" ;;
+    *archive.ubuntu*) echo "200 4096.0" ;;
+    *)                exit 7 ;;
+esac
+APTCURL
+chmod +x "$STUBS/curl"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$STUBS/apt-get"
+chmod +x "$STUBS/apt-get"
+APTSRC="$AP/apt/etc/apt/sources.list.d/ubuntu.sources"
+run_apt() {
+    PATH="$STUBS:$PATH" \
+    VPSSEC_CONF_DIR="$AP/etc" VPSSEC_STATE_DIR="$AP/state" \
+    VPSSEC_APT_SOURCES_LIST="$AP/apt/etc/apt/sources.list" \
+    VPSSEC_APT_SOURCES_D="$AP/apt/etc/apt/sources.list.d" \
+    VPSSEC_APT_BACKUP_DIR="$AP/backup" VPSSEC_APT_CODENAME=jammy \
+    VPSSEC_SKIP_ROOT_CHECK=1 VPSSEC_SKIP_OS_CHECK=1 \
+    bash "$HERE/lib/mirror.sh" "$@"
+}
+printf 'y\n' | run_apt --apt > "$AP/apply.out" 2>&1 || true
+check "apt: fastest mirror applied"      "grep -q 'come from https://ubuntu.pishgaman.net/ubuntu' '$AP/apply.out'"
+check "apt: deb822 URIs rewritten"       "grep -q '^URIs: https://ubuntu.pishgaman.net/ubuntu' '$APTSRC'"
+check "apt: choice persisted"            "grep -q '^APT_MIRROR=https://ubuntu.pishgaman.net/ubuntu' '$AP/etc/mirror.conf'"
+check "apt: pristine snapshot kept"      "[ -f '$AP/backup/pristine/sources.list.d/ubuntu.sources' ]"
+check "apt: logs the change"             "grep -q 'apt mirror applied' '$AP/state/mirror.log'"
+
+# a mirror that passes the speed test but breaks apt must be rolled back
+printf '#!/usr/bin/env bash\nexit 100\n' > "$STUBS/apt-get"
+chmod +x "$STUBS/apt-get"
+sed -i 's|^URIs: .*|URIs: http://archive.ubuntu.com/ubuntu|' "$APTSRC"
+printf 'y\n' | run_apt --apt > "$AP/rollback.out" 2>&1 || true
+check "apt: failed update rolls back"    "grep -q 'restoring the previous configuration' '$AP/rollback.out'"
+check "apt: rollback restored sources"   "grep -q '^URIs: http://archive.ubuntu.com/ubuntu' '$APTSRC'"
+check "apt: refusal is logged"           "grep -q 'apt mirror rejected' '$AP/state/mirror.log'"
+
+# re-apply successfully, confirm status, then reset back to the distro default
+printf '#!/usr/bin/env bash\nexit 0\n' > "$STUBS/apt-get"
+chmod +x "$STUBS/apt-get"
+printf 'y\n' | run_apt --apt > "$AP/apply2.out" 2>&1 || true
+check "apt: re-apply after rollback"     "grep -q '^URIs: https://ubuntu.pishgaman.net/ubuntu' '$APTSRC'"
+run_apt --status > "$AP/status.out" 2>&1 || true
+check "apt: status shows the mirror"     "grep -q 'APT mirror    : https://ubuntu.pishgaman.net/ubuntu' '$AP/status.out'"
+run_apt --reset > "$AP/reset.out" 2>&1 || true
+check "apt: reset restores distro default" "grep -q '^URIs: http://archive.ubuntu.com/ubuntu' '$APTSRC'"
+check "apt: reset drops mirror.conf"     "[ ! -f '$AP/etc/mirror.conf' ]"
+
+# CLI surface
+PATH="$STUBS:$PATH" VPSSEC_CONF_DIR="$AP/etc" VPSSEC_STATE_DIR="$AP/state" \
+    VPSSEC_APT_SOURCES_LIST="$AP/apt/etc/apt/sources.list" \
+    VPSSEC_APT_SOURCES_D="$AP/apt/etc/apt/sources.list.d" \
+    VPSSEC_APT_BACKUP_DIR="$AP/backup" VPSSEC_APT_CODENAME=jammy \
+    VPSSEC_SKIP_ROOT_CHECK=1 VPSSEC_SKIP_OS_CHECK=1 \
+    bash "$HERE/vpssec" mirror apt-test > "$AP/clitest.out" 2>&1 || true
+check "cli 'mirror apt-test' shows table" "grep -q 'APT mirror speed test' '$AP/clitest.out'"
+rm -f "$STUBS/apt-get"
 
 # --- restore global curl stub for any later checks ---
 cat > "$STUBS/curl" <<'CEOF4'

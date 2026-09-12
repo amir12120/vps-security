@@ -20,7 +20,7 @@
 #   unblock      Release a blocked port
 #   update       Update vps-security from GitHub
 #   maint        RAM cache & log cleanup (run / status)
-#   mirror       Best Iranian mirror & DNS (best / test / reset / status)
+#   mirror       Best Iranian mirror & DNS (best / test / apt / apt-test / reset / status)
 #   shield       Bot & Scanner Shield (enable / disable / status)
 #   geo          Country filter (add / remove / list / names / enable / disable / bypass / refresh)
 #   logs         Show monitor log
@@ -69,7 +69,7 @@ fi
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
 REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
 REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"
@@ -812,6 +812,11 @@ cmd_status() {
     else
         printf "  ${DIM}●${RESET} Git mirror      : direct github.com\n"
     fi
+    if [ -f "$VPSSEC_CONF_DIR/mirror.conf" ] && grep -q '^APT_MIRROR=..' "$VPSSEC_CONF_DIR/mirror.conf" 2>/dev/null; then
+        printf "  ${GREEN}●${RESET} APT mirror      : %s\n" "$(grep '^APT_MIRROR=' "$VPSSEC_CONF_DIR/mirror.conf" | cut -d= -f2-)"
+    else
+        printf "  ${DIM}●${RESET} APT mirror      : distribution default\n"
+    fi
 
     # Alerts waiting for a human decision — the headline number, because
     # nothing is blocked until the admin approves it.
@@ -1397,7 +1402,8 @@ Commands:
   unblock      Release a blocked port
   update       Update vps-security from GitHub
   maint        RAM cache & log cleanup (run / status)
-  mirror       Best Iranian mirror & DNS (best / test / reset / status)
+  mirror       Best Iranian mirror & DNS (best / test / apt / apt-test /
+               reset / status) — fastest GitHub mirror, DNS and apt mirror
   shield       Bot & Scanner Shield (enable / disable / status)
   geo          Country filter (add / remove / list / names / enable / disable / bypass / refresh)
   logs         Show monitor log
@@ -1669,17 +1675,21 @@ action_geo_menu() {
 action_mirror_menu() {
     while :; do
         ui_menu "The best Iranian mirror & DNS" \
-            "🏆 Test & apply the fastest (GitHub speed criterion)" \
-            "📊 Test only — show the speed table" \
-            "↩️  Reset — back to direct GitHub & default DNS" \
-            "📋 Current mirror & DNS status" \
+            "🏆 Test & apply the fastest GitHub mirror + DNS" \
+            "📊 Test only — show the GitHub & DNS speed tables" \
+            "📦 Fastest apt (package) mirror — test & apply" \
+            "📊 Test only — show the apt mirror speed table" \
+            "↩️  Reset — back to direct GitHub, default DNS & apt" \
+            "📋 Current mirror, DNS & apt status" \
             "🚪 Back"
         case "$MENU_IDX" in
             1) bash "$SCRIPT_DIR/lib/mirror.sh" --best; ui_press_any_key ;;
             2) bash "$SCRIPT_DIR/lib/mirror.sh" --test; ui_press_any_key ;;
-            3) bash "$SCRIPT_DIR/lib/mirror.sh" --reset; ui_press_any_key ;;
-            4) bash "$SCRIPT_DIR/lib/mirror.sh" --status; ui_press_any_key ;;
-            0|5) return 0 ;;
+            3) bash "$SCRIPT_DIR/lib/mirror.sh" --apt; ui_press_any_key ;;
+            4) bash "$SCRIPT_DIR/lib/mirror.sh" --apt-test; ui_press_any_key ;;
+            5) bash "$SCRIPT_DIR/lib/mirror.sh" --reset; ui_press_any_key ;;
+            6) bash "$SCRIPT_DIR/lib/mirror.sh" --status; ui_press_any_key ;;
+            0|7) return 0 ;;
         esac
     done
 }
@@ -1688,6 +1698,8 @@ cmd_mirror() {
     case "${1:-status}" in
         best|apply) need_root; bash "$SCRIPT_DIR/lib/mirror.sh" --best ;;
         test)       need_root; bash "$SCRIPT_DIR/lib/mirror.sh" --test ;;
+        apt)        need_root; bash "$SCRIPT_DIR/lib/mirror.sh" --apt ;;
+        apt-test)   need_root; bash "$SCRIPT_DIR/lib/mirror.sh" --apt-test ;;
         reset)      need_root; bash "$SCRIPT_DIR/lib/mirror.sh" --reset ;;
         status)     bash "$SCRIPT_DIR/lib/mirror.sh" --status ;;
         *)          bash "$SCRIPT_DIR/lib/mirror.sh" --status ;;

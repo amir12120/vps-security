@@ -32,7 +32,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.5.0 — server hardening toolkit
+  vps-security v1.6.0 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────
@@ -74,7 +74,7 @@ Navigate with **↑/↓** (or `j`/`k`), select with **Enter**, go back with **q*
 | `sudo vpssec maint` | Maintenance menu: run now, toggle swap clear, journal caps, skip list |
 | `sudo vpssec shield status` | Bot & Scanner Shield state + banned IPs |
 | `sudo vpssec geo list` | GeoIP filter configuration |
-| `sudo vpssec mirror` | **The best Iranian mirror & DNS:** times every Iranian GitHub mirror and public DNS from this server, installs the fastest mirror system-wide and switches DNS — criterion: GitHub access speed |
+| `sudo vpssec mirror` | **The best Iranian mirror & DNS:** times every Iranian GitHub mirror, every Iranian resolver and every apt mirror from this server, then installs the fastest of each system-wide — criterion: real GitHub / apt access speed |
 | `sudo vpssec logs [n]` | Show monitor log |
 | `sudo vpssec uninstall` | **Full cleanup:** removes everything, restores SSH to port 22, resets & disables ufw (keeping SSH reachable) |
 
@@ -119,12 +119,21 @@ SHIELD_MODE=auto    # /etc/vps-security/botshield.conf — bans SYN-flood IPs im
 
 ## The best Iranian mirror & DNS
 
-On Iranian servers, GitHub is often slow or unreachable. The **🏁 The best Iranian mirror & DNS** menu item (or `vpssec mirror`) fixes this by measurement, not guessing:
+On Iranian servers, GitHub and the Ubuntu/Debian archives are often slow or unreachable. The **🏁 The best Iranian mirror & DNS** menu item (or `vpssec mirror`) fixes this by measurement, not guessing:
 
-1. **Mirrors** — probes every Iranian GitHub mirror (`gitclone.ir`, `github.iranserver.com`, `gitdl.theazizi.ir`) plus the direct route, timing real HTTPS fetches of the git smart-HTTP endpoint. The winner is installed **system-wide** via `git config --system url.<mirror>.insteadOf https://github.com/`, so every `git clone/pull/fetch` — including `vpssec update` — is redirected automatically.
-2. **DNS** — queries each Iranian public DNS (Shecan, 403.online, Radar, Begzar, Electro, Pishgaman, Shelter) for `github.com` and switches the server to the fastest answerer (systemd-resolved drop-in, or `/etc/resolv.conf` with backup otherwise). A backup makes the change fully reversible.
+1. **GitHub mirrors** — probes every Iranian GitHub mirror (`gitclone.ir`, `github.iranserver.com`, `gitdl.theazizi.ir`) plus the direct route, timing real HTTPS fetches of the git smart-HTTP endpoint. The winner is installed **system-wide** via `git config --system url.<mirror>.insteadOf https://github.com/`, so every `git clone/pull/fetch` — including `vpssec update` — is redirected automatically.
+2. **DNS** — queries a wide list of Iranian resolvers for `github.com` and switches the server to the fastest answerer (systemd-resolved drop-in, or `/etc/resolv.conf` with backup otherwise). The list holds the well-known providers (Shecan, 403.online, Radar, Begzar, Electro, Pishgaman, Shelter) **plus ~20 ISP/DCI resolvers** that are only reachable from inside Iran; duplicates are dropped and providers without a known brand are shown by IP. Nothing is installed unless it actually answers.
+3. **APT mirrors** — downloads `dists/<codename>/InRelease` from each Iranian Ubuntu mirror (then a few international fallbacks) and writes the fastest one into `sources.list` or the deb822 `ubuntu.sources`. A snapshot is taken first, `apt-get update` is run to prove the mirror works, and **a mirror that fails is rolled back automatically** — apt can never be left broken.
 
-`sudo vpssec mirror reset` undoes both changes (removes insteadOf, restores the original DNS). `sudo vpssec mirror status` shows what is applied.
+| Command | What it does |
+|---|---|
+| `sudo vpssec mirror best` | Test GitHub mirrors + DNS, install the fastest of each |
+| `sudo vpssec mirror apt` | Test apt mirrors and switch to the fastest |
+| `sudo vpssec mirror test` / `apt-test` | Show the speed tables, change nothing |
+| `sudo vpssec mirror status` | What is currently applied |
+| `sudo vpssec mirror reset` | Undo everything: remove `insteadOf`, restore the original DNS **and** the distribution's apt sources |
+
+The pristine apt configuration is kept separately from the per-run snapshots, so `reset` returns to the distribution default even after several applies.
 
 ## How the rogue-port monitor works
 
@@ -268,7 +277,7 @@ It stays local-only by default — do not expose it publicly without an authenti
 Nothing here touches the machine it runs on: `ufw`, `ss`, `systemctl`, `apt-get`, `ipset` and `curl` are `PATH`-stubbed and every path is redirected into a temp sandbox.
 
 ```bash
-bash test/smoke.sh              # 274 checks: full install, alert detection + approval, ban expiry, shield, GeoIP, maintenance, mirror/DNS, symlinked CLI, TUI frames, uninstall
+bash test/smoke.sh              # 298 checks: full install, alert detection + approval, ban expiry, shield, GeoIP, maintenance, GitHub mirror / DNS / apt mirror (incl. rollback), symlinked CLI, TUI frames, uninstall
                                 # (a Linux host adds the pty menu checks, the interactive y/n approval and the live guard API checks)
 bash test/simulate-two-host.sh  #  76 checks: two simulated servers (Iran + foreign) with a 3x-ui panel and a backpack tunnel
 ```
