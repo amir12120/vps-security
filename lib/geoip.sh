@@ -22,6 +22,7 @@
 #   geoip.sh --disable              remove all geo rules
 #   geoip.sh --bypass add|remove|list [ip]
 #   geoip.sh --refresh              re-download CIDR lists
+#   geoip.sh --cc-name <CC>         print a country's English name (NL -> netherlands)
 #   geoip.sh --health               exit 0 if enabled
 # ============================================================
 
@@ -197,6 +198,23 @@ CC_TABLE=(
 "PR|PRI|puertorico|پورتوریکو"
 "JM|JAM|jamaica|جامائیکا"
 )
+
+# English name for a 2-letter code (NL -> netherlands). Used by the alert
+# queue so a ban prompt can name the country, not just the code.
+cc_name() {
+    local key entry code rest
+    key="$(norm_cc "$1")"
+    [ -z "$key" ] && return 1
+    for entry in "${CC_TABLE[@]}"; do
+        code="${entry%%|*}"
+        [ "$code" = "$key" ] || continue
+        rest="${entry#*|}"   # strip CODE|
+        rest="${rest#*|}"    # strip A3|
+        printf '%s' "${rest%%|*}"
+        return 0
+    done
+    return 1
+}
 
 # The three predicates below split a row's names on '|' with a local IFS.
 # (Table names are stored lowercase — the caller lowercases the input.)
@@ -743,6 +761,7 @@ case "${1:-}" in
     --remove) shift; need_root; geo_remove_countries "${1:-}";;
     --list)   geo_list ;;
     --names)  cc_list_all ;;
+    --cc-name) shift; cc_name "${1:-}" || true ;;
     --enable) need_root; geo_enable ;;
     --disable) need_root; geo_disable ;;
     --bypass) shift; geo_bypass "${1:-}" "${2:-}" ;;
@@ -759,5 +778,5 @@ case "${1:-}" in
         geo_write_rules 2>/dev/null || true
         ;;
     --health) geo_enabled ;;
-    *) die "usage: geoip.sh (--add <CC,..>|--remove <CC,..>|--list|--names|--enable|--disable|--bypass|--refresh|--health)" ;;
+    *) die "usage: geoip.sh (--add <CC,..>|--remove <CC,..>|--list|--names|--cc-name <CC>|--enable|--disable|--bypass|--refresh|--health)" ;;
 esac

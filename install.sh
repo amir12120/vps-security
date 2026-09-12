@@ -48,7 +48,7 @@ else
     git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TARGET"
 fi
 
-chmod +x "$TARGET/vpssec" "$TARGET"/lib/*.sh "$TARGET"/test/*.sh 2>/dev/null || true
+chmod +x "$TARGET/vpssec" "$TARGET"/lib/*.sh "$TARGET"/scripts/*.sh "$TARGET"/test/*.sh 2>/dev/null || true
 
 # Convenience symlink
 ln -sf "$TARGET/vpssec" /usr/local/bin/vpssec

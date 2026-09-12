@@ -7,8 +7,10 @@
 #   - Per-IP connection rate limits on the protected ports
 #     (ufw "limit": >6 new connections in 30s from one IP -> dropped)
 #   - TCP-flag scan drops (NULL / SYN+FIN / SYN+RST / ALL-flags)
-#   - Auto-ban: an IP that crosses the rate threshold is banned
-#     (ufw deny from IP) for BAN_SECONDS (default 1 hour)
+#   - Detection: an IP that crosses the rate threshold is reported as a
+#     pending alert (lib/alerts.sh). In the default MODE=approve nothing
+#     is banned until the administrator confirms; MODE=auto restores the
+#     old "ban immediately for BAN_SECONDS" behaviour.
 #
 # All rules are written through ufw so they survive reboots.
 #
@@ -18,6 +20,7 @@
 #   botshield.sh --status               shield state + banned IPs
 #   botshield.sh --list                 list banned IPs
 #   botshield.sh --unban <ip>           release a banned IP now
+#   botshield.sh --ban-now <ip> [note]  ban an IP (used after an approval)
 #   botshield.sh --maint                ban-expiry maintenance (timer)
 #   botshield.sh --health               exit 0 if shield enabled
 # ============================================================
@@ -29,8 +32,9 @@ SHIELD_CONF="$VPSSEC_CONF_DIR/botshield.conf"
 BANS_FILE="$VPSSEC_STATE_DIR/shield-bans.list"
 BAN_LOG="$VPSSEC_STATE_DIR/shield-bans.log"
 SHIELD_LOG="$VPSSEC_STATE_DIR/shield.log"
-BAN_SECONDS="${BAN_SECONDS:-3600}"
-BAN_THRESHOLD="${BAN_THRESHOLD:-40}"   # bans logged when hits exceed this
+BAN_SECONDS="${BAN_SECONDS:-86400}"    # 24 hours default
+BAN_THRESHOLD="${BAN_THRESHOLD:-40}"   # alerts/bans raised when hits exceed this
+SHIELD_MODE="${SHIELD_MODE:-approve}"  # approve | auto
 
 cmd_ufw()       { ufw "$@"; }
 cmd_systemctl() { systemctl "$@"; }
@@ -42,6 +46,7 @@ shield_is_enabled() { [ -f "$SHIELD_CONF" ] && grep -q '^SHIELD_ENABLED=1$' "$SH
 
 load_shield_conf() {
     SHIELD_PORTS="${SHIELD_PORTS:-}"
+    # shellcheck disable=SC1090
     [ -f "$SHIELD_CONF" ] && . "$SHIELD_CONF" 2>/dev/null
     return 0
 }
@@ -51,6 +56,8 @@ save_shield_conf() {
     cat > "$SHIELD_CONF" <<EOF
 SHIELD_ENABLED=${SHIELD_ENABLED:-0}
 SHIELD_PORTS=${SHIELD_PORTS:-}
+SHIELD_MODE=${SHIELD_MODE:-approve}
+BAN_SECONDS=${BAN_SECONDS:-86400}
 EOF
     chmod 600 "$SHIELD_CONF"
 }
@@ -245,7 +252,7 @@ scan_and_ban() {
     shield_is_enabled || return 0
     load_shield_conf
     load_tunnel_ports
-    local ports_csv
+    local hits ports_csv
     ports_csv="$(shield_ports "$SHIELD_PORTS")"
     [ -z "$ports_csv" ] && return 0
 
@@ -269,8 +276,20 @@ scan_and_ban() {
             | awk -v P=":$sp_port" '$1 ~ P {print $2}' \
             | sed -E 's/^\[?([0-9a-fA-F:.]+)\]?:[0-9]+$/\1/' | sort | uniq -c \
             | awk -v T="$BAN_THRESHOLD" '$1 >= T {print $2}'); do
-            ban_ip "$ip" "$(printf '%s\n' "$pairs" \
+            hits="$(printf '%s\n' "$pairs" \
                 | awk -v P=":$sp_port" -v IP="$ip" '$1 ~ P && $2 ~ IP' | wc -l)"
+            if [ "$SHIELD_MODE" = "auto" ]; then
+                ban_ip "$ip" "$hits"
+            else
+                # Approval mode: report the IP and let the admin decide.
+                # A monitor, a backup host or a tunnel peer can look exactly
+                # like a flood, and an autonomous ban of one of those is very
+                # hard to notice from the outside.
+                printf '%s DETECT %s (hits=%s on port %s — awaiting approval)\n' \
+                    "$(date '+%Y-%m-%d %H:%M:%S')" "$ip" "$hits" "$sp_port" >> "$SHIELD_LOG"
+                bash "$SCRIPT_DIR/lib/alerts.sh" --report ip "$ip" "$sp_port" \
+                    "$hits new connections to port $sp_port in 30s" || true
+            fi
         done
     done
     return 0
@@ -325,7 +344,12 @@ EOF
     ok "Bot & Scanner Shield enabled."
     ok "  rate limit  : ufw limit on SSH and protected ports (>6 new conns/30s dropped)"
     ok "  scan drops  : NULL / SYN+FIN / SYN+RST / ALL-flag packets dropped"
-    ok "  auto-ban    : SYN-flood IPs banned for $((BAN_SECONDS / 60)) minutes"
+    if [ "$SHIELD_MODE" = "auto" ]; then
+        ok "  auto-ban    : SYN-flood IPs banned for $((BAN_SECONDS / 3600))h without asking"
+    else
+        ok "  detection   : SYN-flood IPs are reported for your approval (no ban yet)"
+        ok "  ban window  : $((BAN_SECONDS / 3600))h once you approve (vpssec alerts)"
+    fi
     ok "  maintenance : timer every 10 min (ban expiry)"
 }
 
@@ -368,8 +392,14 @@ shield_status() {
         echo "State        : disabled"
     fi
     echo "Protected ports: ${SHIELD_PORTS:-(auto: allow-list minus SSH)}"
+    if [ "$SHIELD_MODE" = "auto" ]; then
+        echo "Mode         : auto (ban immediately)"
+    else
+        echo "Mode         : approve (ask the admin before banning)"
+    fi
     echo "Ban duration : ${BAN_SECONDS}s"
     echo "Banned IPs   : $(bans_count)"
+    echo "Awaiting your approval: $(bash "$SCRIPT_DIR/lib/alerts.sh" --count 2>/dev/null || echo 0)"
     if [ -f "$BANS_FILE" ] && [ -s "$BANS_FILE" ]; then
         local now ts ip remain
         now="$(date +%s)"
@@ -397,7 +427,15 @@ case "${1:-}" in
         unban_ip "$IP"
         ok "IP $IP unbanned."
         ;;
+    --ban-now)
+        shift
+        IP="${1:-}"
+        printf '%s' "$IP" | grep -qE '^[0-9a-fA-F.:]+$' || die "invalid IP"
+        need_root
+        ban_ip "$IP" "${2:-approved by admin}"
+        ok "IP $IP banned for $((BAN_SECONDS / 3600))h."
+        ;;
     --maint)   need_root; unban_expired; scan_and_ban ;;
     --health)  shield_is_enabled ;;
-    *) die "usage: botshield.sh (--enable [ports]|--disable|--status|--list|--unban <ip>|--maint|--health)" ;;
+    *) die "usage: botshield.sh (--enable [ports]|--disable|--status|--list|--unban <ip>|--ban-now <ip>|--maint|--health)" ;;
 esac

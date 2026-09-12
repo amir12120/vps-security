@@ -2,12 +2,21 @@
 # ============================================================
 # vps-security — rogue-port monitor
 ## Every run (systemd timer fires every 30 minutes):
-#   1. Unblock any ports whose 1-hour block has expired.
+#   1. Unblock any ports whose block window has expired.
 #   2. Scan live sockets (ss -tunap).
 #   3. Any port BOUND on a public address that is actively serving
-#      traffic and is NOT approved gets BLOCKED via ufw for one hour:
+#      traffic and is NOT approved is flagged to the administrator:
 #        - TCP: a LISTEN socket that also has established connections
 #        - UDP: a bound socket outside the ephemeral port range
+#
+# MODES (monitor.conf: MONITOR_MODE=approve|auto)
+#   approve (default) — record a pending alert and notify the admin; the
+#     port is blocked only after the admin confirms (lib/alerts.sh).
+#     Legitimate-but-unlisted services therefore never get cut off by a
+#     machine's guess: the admin sees "port N is carrying traffic" first.
+#   auto — the pre-1.5.0 behaviour: block the port for BLOCK_SECONDS with
+#     no confirmation. Kept for admins who explicitly want it.
+#
 #   4. Skipped: allow-listed ports, declared tunnel ports, the sshd and
 #      guard ports, already-blocked ports, loopback-only sockets, and
 #      anything the admin has already allowed in ufw.
@@ -25,7 +34,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
 
 MONITOR_LOG="$VPSSEC_STATE_DIR/monitor.log"
-BLOCK_SECONDS="${BLOCK_SECONDS:-3600}"          # 1 hour default
+BLOCK_SECONDS="${BLOCK_SECONDS:-86400}"         # 24 hours default
+MONITOR_MODE="${MONITOR_MODE:-approve}"         # approve | auto
+
+# Load monitor.conf (SSH/guard ports, mode, block window).
+# The file is written by the installer; values in it win over the defaults
+# above, exactly like the systemd unit's EnvironmentFile does elsewhere.
+load_monitor_conf() {
+    [ -f "$MONITOR_CONF" ] || return 0
+    # shellcheck disable=SC1090
+    . "$MONITOR_CONF" 2>/dev/null || true
+    return 0
+}
 
 have_ss()  { command -v ss >/dev/null 2>&1; }
 have_ufw() { command -v ufw >/dev/null 2>&1; }
@@ -101,7 +121,7 @@ unblock_expired() {
                 ufw delete deny "$port"/udp >/dev/null 2>&1 || true
             fi
             sed -i "/|${port}\$/d" "$BLOCK_LIST_FILE" 2>/dev/null || true
-            log_action "UNBLOCK" "$port" "1h block expired"
+            log_action "UNBLOCK" "$port" "block window expired"
             removed=$((removed + 1))
         fi
     done < "$BLOCK_LIST_FILE"
@@ -116,7 +136,7 @@ block_port() {
     ensure_dirs
 
     # Never block our own control ports (ssh port, guard API port)
-    [ -f "$MONITOR_CONF" ] && . "$MONITOR_CONF" 2>/dev/null
+    load_monitor_conf
     self_port="${MONITOR_SELF_PORT:-}"
     guard_port="${MONITOR_GUARD_PORT:-}"
     # Defense in depth: always protect the CURRENT sshd port too, even
@@ -167,7 +187,8 @@ run_scan() {
 
     unblock_expired
 
-    local bound serving ufw_open proto port found=0 blocked=0
+    load_monitor_conf
+    local bound serving ufw_open proto port found=0 blocked=0 alerted=0
     bound="$(bound_local_ports)"
     [ -z "$bound" ] && return 0
     serving="$(serving_local_ports)"
@@ -196,13 +217,34 @@ run_scan() {
             # outside the ephemeral range and never block client sockets.
             udp_is_client_port "$port" && continue
         fi
-        block_port "$port" "rogue $proto service carrying traffic"
-        blocked=$((blocked + 1))
+        if [ "$MONITOR_MODE" = "auto" ]; then
+            block_port "$port" "rogue $proto service carrying traffic"
+            blocked=$((blocked + 1))
+        else
+            # Approval mode: report, do not touch the firewall. The admin
+            # decides — a service that is legitimate but simply not in the
+            # allow-list yet must not be cut off by a machine's guess.
+            printf '%s DETECT %s (rogue %s service carrying traffic — awaiting approval)\n' \
+                "$(date '+%Y-%m-%d %H:%M:%S')" "$port" "$proto" >> "$MONITOR_LOG"
+            # stdout is intentional: an interactive 'vpssec scan' shows the
+            # notice immediately, the timer run lands in the journal.
+            "$SCRIPT_DIR/lib/alerts.sh" --report port "$port" "$port" \
+                "rogue $proto service carrying traffic, not in your allow-list" || true
+            alerted=$((alerted + 1))
+        fi
     done <<< "$bound"
 
-    printf '%s scan done: %d bound port(s) seen, %d newly blocked\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "$found" "$blocked" >> "$MONITOR_LOG"
+    printf '%s scan done: %d bound port(s) seen, %d newly blocked, %d awaiting approval\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$found" "$blocked" "$alerted" >> "$MONITOR_LOG"
     return 0
+}
+
+# Block a port right now, after the administrator approved the alert.
+block_port_now() {
+    local port="$1" reason="${2:-approved by admin}"
+    is_valid_port "$port" || die "usage: monitor.sh --block-now <port> [reason]"
+    block_port "$port" "$reason"
+    ok "Port $port blocked for $((BLOCK_SECONDS / 3600))h."
 }
 
 # Manual unblock (CLI)
@@ -222,10 +264,17 @@ unblock_port_now() {
 # Show current monitor status
 show_status() {
     ensure_dirs
+    load_monitor_conf
     echo "=== rogue-port monitor ==="
     load_allowed_ports
     echo "Allowed ports : ${ALLOWED_PORTS[*]:-none}"
+    if [ "$MONITOR_MODE" = "auto" ]; then
+        echo "Mode          : auto (block immediately)"
+    else
+        echo "Mode          : approve (ask the admin first)"
+    fi
     echo "Block window  : ${BLOCK_SECONDS}s"
+    echo "Awaiting your approval: $(bash "$SCRIPT_DIR/lib/alerts.sh" --count 2>/dev/null || echo 0)"
     if [ -f "$BLOCK_LIST_FILE" ] && [ -s "$BLOCK_LIST_FILE" ]; then
         echo "Currently blocked:"
         local now ts port remain
@@ -244,8 +293,9 @@ show_status() {
 }
 
 case "${1:-}" in
-    --scan)    run_scan ;;
-    --status)  show_status ;;
-    --unblock) shift; unblock_port_now "${1:-}" ;;
-    *) die "usage: monitor.sh (--scan|--status|--unblock <port>)" ;;
+    --scan)      run_scan ;;
+    --status)    show_status ;;
+    --unblock)   shift; unblock_port_now "${1:-}" ;;
+    --block-now) shift; need_root; block_port_now "${1:-}" "${2:-}" ;;
+    *) die "usage: monitor.sh (--scan|--status|--unblock <port>|--block-now <port> [reason])" ;;
 esac

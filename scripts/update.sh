@@ -13,7 +13,7 @@ fi
 echo "[i] Updating vps-security..."
 git -C "$TARGET" fetch origin "$BRANCH"
 git -C "$TARGET" reset --hard "origin/$BRANCH"
-chmod +x "$TARGET/vpssec" "$TARGET"/lib/*.sh "$TARGET"/test/*.sh 2>/dev/null || true
+chmod +x "$TARGET/vpssec" "$TARGET"/lib/*.sh "$TARGET"/scripts/*.sh "$TARGET"/test/*.sh 2>/dev/null || true
 ln -sf "$TARGET/vpssec" /usr/local/bin/vpssec
 
 echo "[✓] vps-security updated to the latest version."

@@ -14,6 +14,8 @@
 #                never rate-limited: use this for reverse/direct tunnels
 #   port         Change the SSH port
 #   scan         Run a rogue-port scan right now
+#   alerts       Pending alerts — approve (ban 24h) or dismiss (nothing is
+#                blocked until you confirm)
 #   blocked      View blocked ports
 #   unblock      Release a blocked port
 #   update       Update vps-security from GitHub
@@ -67,7 +69,7 @@ fi
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.4.1"
+VERSION="1.5.0"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
 REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
 REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"
@@ -353,6 +355,19 @@ blocked_count() {
     [ -f "$BLOCK_LIST_FILE" ] && grep -cE '^[0-9]+\|[0-9]+$' "$BLOCK_LIST_FILE" || true
 }
 
+# Alerts waiting for the admin's decision (never blocked on their own).
+alerts_count() {
+    bash "$SCRIPT_DIR/lib/alerts.sh" --count 2>/dev/null || echo 0
+}
+
+# How long a block/ban lasts, as configured by the installer.
+MONITOR_CONF="$VPSSEC_CONF_DIR/monitor.conf"
+load_monitor_env() {
+    [ -f "$MONITOR_CONF" ] && . "$MONITOR_CONF" 2>/dev/null
+    BLOCK_SECONDS="${BLOCK_SECONDS:-86400}"
+    return 0
+}
+
 ufw_active() {
     command -v ufw >/dev/null 2>&1 && [ "$(ufw status 2>/dev/null | head -1 | awk '{print $2}')" = "active" ]
 }
@@ -399,7 +414,8 @@ _install_guided() {
     echo "  1. Run 'apt update && apt upgrade -y'"
     echo "  2. Change the SSH port to a new one you choose"
     echo "  3. Install ufw, open the ports you approve, enable the firewall"
-    echo "  4. Install a monitor that auto-blocks rogue ports for 1 hour"
+    echo "  4. Install a monitor that detects rogue ports and reports them"
+    echo "     for your approval (nothing is firewalled behind your back)"
     echo
 
     # ------------------------------------------------
@@ -593,13 +609,17 @@ _install_guided() {
     # ------------------------------------------------
     echo "Step 4/4 — Rogue-port monitor"
     info "Every 30 minutes the server is scanned for connections on ports"
-    info "outside your allow-list. A rogue port carrying traffic is blocked"
-    info "via ufw for one hour, then automatically released."
+    info "outside your allow-list."
+    info "Suspicious findings are REPORTED to you — with the IP, its country"
+    info "and the port — and are blocked only after you approve them (y)."
+    info "Approved bans last 24 hours and can be released at any time."
     local guard_port
     guard_port="$(read_port "Local API port for the monitor (for the future dashboard)" "18080")"
     cat > "$MONITOR_CONF" <<EOF
 MONITOR_SELF_PORT=$current_port
 MONITOR_GUARD_PORT=$guard_port
+MONITOR_MODE=approve
+BLOCK_SECONDS=86400
 EOF
     chmod 600 "$MONITOR_CONF"
 
@@ -621,7 +641,7 @@ EOF
     # ------------------------------------------------
     echo
     echo "Step 5/5 — Bot shield & GeoIP filter (optional)"
-    if read_confirm "Enable the Bot & Scanner Shield (rate limits + auto-ban)? [Y/n] "; then
+    if read_confirm "Enable the Bot & Scanner Shield (rate limits + detection)? [Y/n] "; then
         "$SCRIPT_DIR/lib/botshield.sh" --enable || true
     else
         info "You can enable it later from the menu (Bot & Scanner Shield)."
@@ -645,7 +665,9 @@ EOF
     echo
     info "SSH       : port $current_port"
     info "Firewall  : ufw active, allowed ports: $(tr '\n' ' ' < "$ALLOWED_PORTS_CONF" | tr -s ' ')"
-    info "Monitor   : every 30 min, 1-hour auto-block, guard port $guard_port"
+    info "Monitor   : every 30 min; detections wait for your approval, guard port $guard_port"
+    info "Approval  : sudo vpssec alerts   (ban 24h, or dismiss; a login notice"
+    info "             is shown at every SSH login while alerts are pending)"
     echo
     info "CLI       : sudo vpssec"
     info "Status    : sudo vpssec status"
@@ -725,6 +747,12 @@ EOF
     $SYSTEMCTL enable --now vps-security-maint.timer
     $SYSTEMCTL restart vps-security-guard.service
     ok "Monitor timer armed (every 30 min), maintenance timer armed (every 2 days), guard service started."
+
+    # Login notice for pending alerts: the approval model only works if the
+    # admin is told, and an SSH login is the one place they always look.
+    if install_motd; then
+        ok "Login notice installed (/etc/update-motd.d/99-vps-security-alerts)."
+    fi
 }
 
 # ============================================================
@@ -783,6 +811,16 @@ cmd_status() {
         printf "  ${GREEN}●${RESET} Git mirror      : %s\n" "$mn"
     else
         printf "  ${DIM}●${RESET} Git mirror      : direct github.com\n"
+    fi
+
+    # Alerts waiting for a human decision — the headline number, because
+    # nothing is blocked until the admin approves it.
+    local pending_n
+    pending_n="$(alerts_count)"
+    if [ "${pending_n:-0}" -gt 0 ]; then
+        printf "  ${YELLOW}●${RESET} Pending alerts  : %s suspicious event(s) — nothing blocked yet (menu: Pending alerts)\n" "$pending_n"
+    else
+        printf "  ${GREEN}●${RESET} Pending alerts  : 0\n"
     fi
 
     # Summary
@@ -968,11 +1006,105 @@ cmd_ports() {
 }
 
 # ============================================================
+# Pending alerts — approve (ban 24h) or dismiss
+# ============================================================
+
+# Interactive reviewer: walks the queue one event at a time and asks the
+# exact question the admin needs to answer. Nothing reaches the firewall
+# until "y" is pressed — that is what keeps a legitimate-but-unlisted
+# service, a monitoring host or a tunnel peer recoverable.
+action_alerts() {
+    need_root
+    ensure_dirs
+    load_monitor_env
+    ui_title "Pending Alerts — nothing is blocked until you approve"
+
+    local total
+    total="$(alerts_count)"
+    if [ "$total" -eq 0 ]; then
+        info "No suspicious activity is waiting for your approval. ✓"
+        return 0
+    fi
+
+    # No terminal (timer / scripted run): just print the queue.
+    if [ ! -t 0 ]; then
+        bash "$SCRIPT_DIR/lib/alerts.sh" --list
+        return 0
+    fi
+
+    info "$total suspicious event(s) detected. You decide what happens next."
+    local pos=1 line kind target desc action
+    while :; do
+        line="$(bash "$SCRIPT_DIR/lib/alerts.sh" --get "$pos")"
+        [ -z "$line" ] && break
+        desc="$(bash "$SCRIPT_DIR/lib/alerts.sh" --describe "$pos")"
+        kind="$(printf '%s' "$line" | cut -d'|' -f2)"
+        target="$(printf '%s' "$line" | cut -d'|' -f3)"
+        echo
+        printf "  ${YELLOW}🚨 %s${RESET}\n" "$desc"
+        if [ "$kind" = "ip" ]; then
+            printf "     Ban IP %s for %s?  " "$target" "$((BAN_SECONDS / 3600))h"
+        else
+            printf "     Block port %s for %s?  " "$target" "$((BLOCK_SECONDS / 3600))h"
+        fi
+        printf "${DIM}[y = yes · n = no, dismiss · s = skip · a = approve all · q = stop]${RESET} "
+        read -r action
+        case "$action" in
+            [Yy]*)  bash "$SCRIPT_DIR/lib/alerts.sh" --approve "$pos" || true ;;
+            [Nn]*)  bash "$SCRIPT_DIR/lib/alerts.sh" --dismiss "$pos" || true ;;
+            [Aa]*)  bash "$SCRIPT_DIR/lib/alerts.sh" --approve-all ; break ;;
+            [Qq])   break ;;
+            *)      info "Skipped — it stays in the queue for later."
+                    pos=$((pos + 1)) ;;
+        esac
+    done
+
+    echo
+    ui_line
+    [ "$(alerts_count)" -gt 0 ] && info "Still awaiting approval: $(alerts_count) (review later with: sudo vpssec alerts)"
+    [ "$(blocked_count)" -gt 0 ] && info "Blocked ports: $(blocked_count) — release one with: sudo vpssec unblock"
+    if [ -f "$VPSSEC_STATE_DIR/shield-bans.list" ] && [ -s "$VPSSEC_STATE_DIR/shield-bans.list" ]; then
+        info "Banned IPs: $(grep -cE '^[0-9]+\|' "$VPSSEC_STATE_DIR/shield-bans.list") — release one with: sudo vpssec shield unban"
+    fi
+    info "Every ban is temporary: it expires on its own (the timer releases it)."
+}
+
+cmd_alerts() {
+    case "${1:-review}" in
+        list|show)  bash "$SCRIPT_DIR/lib/alerts.sh" --list ;;
+        count)      alerts_count ;;
+        approve)    need_root; bash "$SCRIPT_DIR/lib/alerts.sh" --approve "${2:-}" ;;
+        dismiss)    need_root; bash "$SCRIPT_DIR/lib/alerts.sh" --dismiss "${2:-}" ;;
+        approve-all) need_root; bash "$SCRIPT_DIR/lib/alerts.sh" --approve-all ;;
+        dismiss-all) need_root; bash "$SCRIPT_DIR/lib/alerts.sh" --dismiss-all ;;
+        review|*)   action_alerts ;;
+    esac
+}
+
+# Login notice: /etc/update-motd.d/99-vps-security-alerts
+# Turns the pending queue into something the admin cannot miss.
+install_motd() {
+    local dir="${VPSSEC_MOTD_DIR:-/etc/update-motd.d}" target
+    [ -d "$dir" ] || return 0
+    target="$dir/99-vps-security-alerts"
+    cp "$SCRIPT_DIR/scripts/motd-alerts.sh" "$target" 2>/dev/null || return 0
+    chmod 755 "$target" 2>/dev/null || true
+    return 0
+}
+
+remove_motd() {
+    local dir="${VPSSEC_MOTD_DIR:-/etc/update-motd.d}"
+    rm -f "$dir/99-vps-security-alerts" 2>/dev/null || true
+    return 0
+}
+
+# ============================================================
 # Blocked ports + unblock
 # ============================================================
 
 action_blocked_view() {
     ensure_dirs
+    load_monitor_env
     ui_title "Blocked Ports"
     local n=0
     if [ -f "$BLOCK_LIST_FILE" ] && [ -s "$BLOCK_LIST_FILE" ]; then
@@ -982,7 +1114,7 @@ action_blocked_view() {
             [ -z "${ts:-}" ] && continue
             is_valid_port "$port" || continue
             n=$((n + 1))
-            remain=$(( 3600 - (now - ts) ))
+            remain=$(( BLOCK_SECONDS - (now - ts) ))
             [ "$remain" -lt 0 ] && remain=0
             printf "  %2d) port %-6s ${YELLOW}unblocks in %dm %02ds${RESET}\n" "$n" "$port" $((remain / 60)) $((remain % 60))
         done < "$BLOCK_LIST_FILE"
@@ -1043,7 +1175,23 @@ action_scan() {
     ui_title "Run Rogue-Port Scan Now"
     info "Scanning live connections..."
     "$SCRIPT_DIR/lib/monitor.sh" --scan || true
-    ok "Scan finished. Check Blocked Ports for the results."
+    load_monitor_env
+    if [ "$(alerts_count)" -gt 0 ]; then
+        warn "Scan finished: $(alerts_count) suspicious event(s) need your decision."
+        info "Nothing was blocked — you approve each one."
+        if [ -t 0 ]; then
+            echo
+            if read_confirm "Review and decide now? [Y/n] "; then
+                action_alerts
+            else
+                info "Review later with: sudo vpssec alerts"
+            fi
+        else
+            bash "$SCRIPT_DIR/lib/alerts.sh" --list
+        fi
+    else
+        ok "Scan finished — no suspicious activity found."
+    fi
 }
 
 # ============================================================
@@ -1136,7 +1284,7 @@ cmd_update() {
         return 0
     fi
     git -C "$TARGET_DIR" reset --hard origin/main >/dev/null 2>&1
-    chmod +x "$TARGET_DIR/vpssec" "$TARGET_DIR"/lib/*.sh "$TARGET_DIR"/test/*.sh 2>/dev/null || true
+    chmod +x "$TARGET_DIR/vpssec" "$TARGET_DIR"/lib/*.sh "$TARGET_DIR"/scripts/*.sh "$TARGET_DIR"/test/*.sh 2>/dev/null || true
     ln -sf "$TARGET_DIR/vpssec" /usr/local/bin/vpssec
     ok "Updated: $before → $after."
     if [ -x "$TARGET_DIR/lib/monitor.sh" ]; then
@@ -1214,6 +1362,7 @@ cmd_uninstall() {
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-shield.{service,timer}
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-geo.{service,timer}
     $SYSTEMCTL daemon-reload
+    remove_motd
     rm -rf "$VPSSEC_CONF_DIR" "$VPSSEC_STATE_DIR"
     rm -rf "$INSTALL_DIR"
     rm -rf "$TARGET_DIR"
@@ -1238,6 +1387,8 @@ Commands:
                never rate-limited: use this for reverse/direct tunnels
   port         Change the SSH port
   scan         Run a rogue-port scan right now
+  alerts       Pending alerts: approve (ban 24h) or dismiss — nothing is
+               blocked until you confirm; 'alerts approve <n>' / 'dismiss <n>'
   blocked      View blocked ports
   unblock      Release a blocked port
   update       Update vps-security from GitHub
@@ -1268,12 +1419,19 @@ show_menu() {
     # "open the menu after setup" behaviour can never recurse into itself.
     VPSSEC_MENU_ACTIVE=1
     while :; do
+        # The alert count belongs in the title: the whole point of the
+        # approval model is that the admin sees the event and decides.
+        local pending alerts_label
+        pending="$(alerts_count)"
+        alerts_label="🪧 Pending alerts — review & approve bans"
+        [ "${pending:-0}" -gt 0 ] && alerts_label="🚨 Pending alerts (${pending}) — review & approve bans"
         ui_menu "Main Menu" \
             "🚀 Guided install (update · SSH port · firewall · monitor)" \
             "📊 Dashboard — system security status" \
             "🔌 Ports — add / remove allowed ports" \
             "🔑 Change SSH port" \
             "🔍 Scan for rogue ports now" \
+            "$alerts_label" \
             "⛔ View blocked ports" \
             "🔓 Unblock a port" \
             "📜 Monitor logs" \
@@ -1290,16 +1448,17 @@ show_menu() {
             3) action_ports_menu ;;
             4) cmd_port; ui_press_any_key ;;
             5) action_scan; ui_press_any_key ;;
-            6) action_blocked_view; ui_press_any_key ;;
-            7) action_unblock; ui_press_any_key ;;
-            8) cmd_logs; ui_press_any_key ;;
-            9) cmd_update; ui_press_any_key ;;
-            10) action_maint_menu; ui_press_any_key ;;
-            11) action_shield_menu ;;
-            12) action_geo_menu ;;
-            13) action_mirror_menu ;;
-            14) cmd_uninstall; ui_press_any_key ;;
-            0|15) exit 0 ;;
+            6) action_alerts; ui_press_any_key ;;
+            7) action_blocked_view; ui_press_any_key ;;
+            8) action_unblock; ui_press_any_key ;;
+            9) cmd_logs; ui_press_any_key ;;
+            10) cmd_update; ui_press_any_key ;;
+            11) action_maint_menu; ui_press_any_key ;;
+            12) action_shield_menu ;;
+            13) action_geo_menu ;;
+            14) action_mirror_menu ;;
+            15) cmd_uninstall; ui_press_any_key ;;
+            0|16) exit 0 ;;
         esac
     done
 }
@@ -1590,6 +1749,7 @@ case "${1:-}" in
     tunnels)   shift; cmd_tunnels "$@" ;;
     port)      cmd_port ;;
     scan)      need_root; action_scan ;;
+    alerts)    shift; cmd_alerts "$@" ;;
     blocked)   cmd_blocked ;;
     unblock)   shift; cmd_unblock "$@" ;;
     update)    cmd_update ;;

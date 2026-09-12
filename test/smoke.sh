@@ -44,6 +44,7 @@ export VPSSEC_TARGET_DIR="$SANDBOX/opt/vps-security"
 export VPSSEC_SSHD_CONFIG="$SANDBOX/etc-ssh/sshd_config"
 export UFW_DIR="$SANDBOX/ufw"
 export GEO_TMP="$SANDBOX/geotmp"
+export VPSSEC_MOTD_DIR="$SANDBOX/motd"
 export VPSSEC_SKIP_ROOT_CHECK=1
 export VPSSEC_SKIP_OS_CHECK=1
 # Never let a test run block on the post-install TUI menu (the pty section
@@ -54,7 +55,7 @@ VER="$(grep -m1 '^VERSION=' "$HERE/vpssec" | cut -d'"' -f2)"
 export PATH="$STUBS:$PATH"
 SSH_CFG="$SANDBOX/etc-ssh/sshd_config"
 trap 'rm -rf "$SANDBOX"' EXIT
-mkdir -p "$SANDBOX/ufw"
+mkdir -p "$SANDBOX/ufw" "$SANDBOX/motd"
 printf '# ufw before rules stub\n*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' > "$SANDBOX/ufw/before.rules"
 
 printf '#Stub sshd_config\nPort 22\n' > "$SSH_CFG"
@@ -217,6 +218,11 @@ check "monitor timer unit installed"    "grep -q 'monitor.sh --scan' '$VPSSEC_SY
 check "timer enabled via systemctl"     "grep -q 'enable --now vps-security-monitor.timer' '$SANDBOX/systemctl.log'"
 check "maint timer unit installed"      "grep -q 'OnUnitActiveSec=2d' '$VPSSEC_SYSTEMD_DIR/vps-security-maint.timer' && grep -q 'maintain.sh --run' '$VPSSEC_SYSTEMD_DIR/vps-security-maint.service'"
 check "maint timer enabled via systemctl" "grep -q 'enable --now vps-security-maint.timer' '$SANDBOX/systemctl.log'"
+check "install adds the login notice"   "[ -x '$SANDBOX/motd/99-vps-security-alerts' ]"
+check "login notice uses the sandbox state dir" "grep -q 'VPSSEC_STATE_DIR' '$SANDBOX/motd/99-vps-security-alerts'"
+check "approval mode recorded in monitor.conf" "grep -q '^MONITOR_MODE=approve$' '$VPSSEC_CONF_DIR/monitor.conf'"
+check "24h block window recorded"       "grep -q '^BLOCK_SECONDS=86400$' '$VPSSEC_CONF_DIR/monitor.conf'"
+check "install explains the approval model" "grep -q 'blocked only after you approve' '$SANDBOX/install.out'"
 
 echo
 echo "=== smoke: standalone SSH port change opens ufw + allow-list BEFORE switching ==="
@@ -250,49 +256,106 @@ rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --scan > "$SANDBOX/scan.out" 2>&1
 if [ -s "$SANDBOX/scan.out" ]; then echo "--- scan.out ---"; cat "$SANDBOX/scan.out"; fi
 
-check "rogue tcp 9999 blocked"          "grep -q 'deny 9999/tcp' '$SANDBOX/ufw.log'"
-check "rogue udp 9998 blocked"          "grep -q 'deny 9998/udp' '$SANDBOX/ufw.log'"
-check "unconnected udp 53 NOT blocked"  "! grep -q 'deny 53/' '$SANDBOX/ufw.log'"
-check "ssh port 2222 NOT blocked"       "! grep -q 'deny 2222/' '$SANDBOX/ufw.log'"
-check "allowed port 443 NOT blocked"    "! grep -q 'deny 443/' '$SANDBOX/ufw.log'"
+ALERTS_FILE="$VPSSEC_STATE_DIR/pending-alerts.list"
+ALERT_LOG="$VPSSEC_STATE_DIR/alerts.log"
+alerts_count() { bash "$HERE/lib/alerts.sh" --count 2>/dev/null || echo 0; }
+
+# ---- approval model (default): detect, notify, then WAIT ----
+check "rogue tcp 9999 is reported, not blocked" "grep -qE '^[0-9]+\|port\|9999\|' '$ALERTS_FILE'"
+check "rogue udp 9998 is reported, not blocked" "grep -qE '^[0-9]+\|port\|9998\|' '$ALERTS_FILE'"
+check "nothing is blocked before approval"       "! grep -q 'deny 9999' '$SANDBOX/ufw.log' && ! grep -q 'deny 9998' '$SANDBOX/ufw.log'"
+check "no block entry before approval"          "! [ -s '$VPSSEC_STATE_DIR/blocked-ports.list' ]"
+check "detection logged in monitor.log"         "grep -q 'DETECT 9999' '$VPSSEC_STATE_DIR/monitor.log'"
+check "detection logged in alerts.log"          "grep -q 'DETECTED port 9999' '$ALERT_LOG'"
+check "admin is notified on the console"        "grep -q 'Suspicious activity detected' '$SANDBOX/scan.out'"
+check "notice points at the review command"     "grep -q 'vpssec alerts' '$SANDBOX/scan.out'"
+check "unconnected udp 53 is not reported"      "! grep -qE '^[0-9]+\|port\|53\|' '$ALERTS_FILE'"
+check "control port 3333 is not reported"       "! grep -qE '^[0-9]+\|port\|3333\|' '$ALERTS_FILE'"
+check "allowed port 443 is not reported"        "! grep -qE '^[0-9]+\|port\|443\|' '$ALERTS_FILE'"
+check "loopback-only service is not reported"   "! grep -qE '^[0-9]+\|port\|9997\|' '$ALERTS_FILE'"
 
 # ---- tunnel safety: outbound sockets and declared tunnel ports ----
 check "outbound tcp source port NOT blocked" "! grep -q 'deny 45892' '$SANDBOX/ufw.log'"
+check "outbound tcp source port not reported" "! grep -qE '^[0-9]+\|port\|45892\|' '$ALERTS_FILE'"
 check "outbound udp source port NOT blocked" "! grep -q 'deny 41555' '$SANDBOX/ufw.log'"
 check "loopback-only service NOT blocked"    "! grep -q 'deny 9997' '$SANDBOX/ufw.log'"
 check "tunnel port 8080 NOT blocked"         "! grep -q 'deny 8080' '$SANDBOX/ufw.log'"
+check "tunnel port 8080 is not reported"     "! grep -qE '^[0-9]+\|port\|8080\|' '$ALERTS_FILE'"
 check "tunnel skip recorded in log"          "grep -q 'SKIP 8080 (declared tunnel port)' '$VPSSEC_STATE_DIR/monitor.log'"
 check "scan log names the tunnel ports"      "grep -q 'tunnel: 8080' '$VPSSEC_STATE_DIR/monitor.log'"
 check "blocked list has no tunnel port"      "! grep -qE '\|8080$' '$VPSSEC_STATE_DIR/blocked-ports.list'"
 
 # ---- a port the admin opened in ufw is approval in itself ----
 printf '9999/tcp                   ALLOW       Anywhere\n' > "$SANDBOX/ufw-status.txt"
-rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/blocked-ports.list"
+rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/blocked-ports.list" "$ALERTS_FILE"
 UFW_LOG="$SANDBOX/ufw.log" UFW_STATUS_EXTRA="$SANDBOX/ufw-status.txt" \
     bash "$HERE/lib/monitor.sh" --scan > /dev/null 2>&1
 check "ufw-allowed port is respected"   "! grep -q 'deny 9999/tcp' '$SANDBOX/ufw.log'"
+check "ufw-allowed port is not reported" "! grep -qE '^[0-9]+\|port\|9999\|' '$ALERTS_FILE'"
 # restore the plain status stub for the remaining scans
 printf '' > "$SANDBOX/ufw-status.txt"
-rm -f "$VPSSEC_STATE_DIR/blocked-ports.list"
+rm -f "$VPSSEC_STATE_DIR/blocked-ports.list" "$ALERTS_FILE"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --scan > /dev/null 2>&1
-check "blocks recorded with timestamp"  "grep -qE '^[0-9]+\|9999$' '$VPSSEC_STATE_DIR/blocked-ports.list' && grep -qE '^[0-9]+\|9998$' '$VPSSEC_STATE_DIR/blocked-ports.list'"
-check "BLOCK events logged"             "grep -q 'BLOCK 9999' '$VPSSEC_STATE_DIR/port-blocks.log' && grep -q 'BLOCK 9998' '$VPSSEC_STATE_DIR/port-blocks.log'"
+check "alerts recorded with timestamp"  "grep -qE '^[0-9]+\|port\|9999\|' '$ALERTS_FILE' && grep -qE '^[0-9]+\|port\|9998\|' '$ALERTS_FILE'"
+check "DETECT events logged"            "grep -q 'DETECT 9999' '$VPSSEC_STATE_DIR/monitor.log' && grep -q 'DETECT 9998' '$VPSSEC_STATE_DIR/monitor.log'"
 
 echo
-echo "=== smoke: second scan does not double-block ==="
+echo "=== smoke: repeated alerts are never duplicated ==="
 rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --scan > /dev/null 2>&1
-check "no duplicate deny rules"         "! grep -q 'deny 9999/tcp' '$SANDBOX/ufw.log' && ! grep -q 'deny 9998/tcp' '$SANDBOX/ufw.log'"
+check "no duplicate alert for the same port" "[ \"\$(grep -cE '^[0-9]+\|port\|9999\|' '$ALERTS_FILE')\" -eq 1 ]"
+check "still nothing blocked"                "! grep -q 'deny 9999/tcp' '$SANDBOX/ufw.log'"
+check "re-detection recorded as still-pending" "grep -q 'STILL-PENDING port 9999' '$ALERT_LOG'"
 
 echo
-echo "=== smoke: expired block is released and re-detected ==="
-OLD=$(( $(date +%s) - 3700 ))
+echo "=== smoke: alert review — approve bans, dismiss forgets ==="
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" alerts list > "$SANDBOX/alerts-list.out" 2>&1 || true
+check "alerts list shows the pending port"  "grep -q '9999' '$SANDBOX/alerts-list.out'"
+check "alerts list shows the detection age" "grep -qE 'just now|ago' '$SANDBOX/alerts-list.out'"
+check "alerts list says nothing is blocked" "grep -q 'nothing is blocked yet' '$SANDBOX/alerts-list.out'"
+check "alerts count reports 2"              "[ \"$(bash "$HERE/lib/alerts.sh" --count)\" -eq 2 ]"
+
+PICK="$(bash "$HERE/lib/alerts.sh" --get 1 | cut -d'|' -f3)"
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" alerts approve 1 > "$SANDBOX/approve.out" 2>&1 || true
+check "approve blocks exactly that port"  "grep -q 'deny $PICK/tcp' '$SANDBOX/ufw.log'"
+check "approve records the block"         "grep -qE \"\\|$PICK\\$\" '$VPSSEC_STATE_DIR/blocked-ports.list'"
+check "approve says how long the ban lasts" "grep -q 'blocked for 24h' '$SANDBOX/approve.out'"
+check "approve is logged"                 "grep -q 'APPROVED port $PICK' '$ALERT_LOG'"
+check "approved alert left the queue"     "[ \"$(alerts_count)\" -eq 1 ]"
+
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" alerts dismiss 1 > "$SANDBOX/dismiss.out" 2>&1 || true
+check "dismiss empties the queue"         "[ \"$(alerts_count)\" -eq 0 ]"
+check "dismiss blocks nothing"            "! grep -q 'deny' '$SANDBOX/ufw.log'"
+check "dismiss is logged"                 "grep -q 'DISMISSED port' '$ALERT_LOG'"
+
+# a rogue port that is now blocked must not come back as a new alert
+rm -f "$ALERTS_FILE"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --scan > /dev/null 2>&1
+check "already-punished port is not re-alerted" "! grep -qE "^[0-9]+\\|port\\|$PICK\\|" '$ALERTS_FILE'"
+check "the other rogue port returns to the queue" "[ \"$(alerts_count)\" -eq 1 ]"
+rm -f "$ALERTS_FILE"
+
+echo
+echo "=== smoke: expired block is released (24h window) ==="
+OLD=$(( $(date +%s) - 90000 ))
 printf '%s|9999\n' "$OLD" > "$VPSSEC_STATE_DIR/blocked-ports.list"
 rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --scan > /dev/null 2>&1
 check "expired block released"          "grep -q 'delete deny 9999/tcp' '$SANDBOX/ufw.log'"
-check "rogue re-blocked after expiry"   "grep -q 'deny 9999/tcp' '$SANDBOX/ufw.log'"
 check "UNBLOCK event logged"            "grep -q 'UNBLOCK 9999' '$VPSSEC_STATE_DIR/port-blocks.log'"
+check "released port is reported again" "grep -qE '^[0-9]+\|port\|9999\|' '$VPSSEC_STATE_DIR/pending-alerts.list'"
+
+echo
+echo "=== smoke: MONITOR_MODE=auto keeps the immediate-block behaviour ==="
+sed -i 's/^MONITOR_MODE=.*/MONITOR_MODE=auto/' "$VPSSEC_CONF_DIR/monitor.conf"
+rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/blocked-ports.list" "$VPSSEC_STATE_DIR/pending-alerts.list"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --scan > /dev/null 2>&1
+check "auto mode blocks immediately"      "grep -q 'deny 9999/tcp' '$SANDBOX/ufw.log'"
+check "auto mode raises no alert"         "! [ -s '$VPSSEC_STATE_DIR/pending-alerts.list' ]"
+check "monitor status reports the mode"   "bash '$HERE/lib/monitor.sh' --status | grep -q 'Mode *: *approve\|Mode *: *auto'"
+sed -i 's/^MONITOR_MODE=.*/MONITOR_MODE=approve/' "$VPSSEC_CONF_DIR/monitor.conf"
 
 echo
 echo "=== smoke: CLI unblock ==="
@@ -321,10 +384,59 @@ check "tunnels remove works"            "! grep -qx '9999' '$VPSSEC_CONF_DIR/tun
 sed -i '/^9999$/d' "$VPSSEC_CONF_DIR/allowed-ports.list"
 rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/blocked-ports.list"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --scan > /dev/null 2>&1
-check "undeclared port is monitored again" "grep -q 'deny 9999/tcp' '$SANDBOX/ufw.log'"
+check "undeclared port is monitored again" "! grep -q 'deny 9999/tcp' '$SANDBOX/ufw.log' && grep -qE '^[0-9]+\|port\|9999\|' '$VPSSEC_STATE_DIR/pending-alerts.list'"
 # the still-declared tunnel port stays protected
 check "remaining tunnel port still safe" "! grep -q 'deny 8443' '$SANDBOX/ufw.log'"
 bash "$HERE/vpssec" tunnels remove 8443 > /dev/null 2>&1 || true
+
+echo
+echo "=== smoke: alert wording, country lookup and login notice ==="
+# A tiny offline country list lets the ip -> country lookup be verified
+# without any network access (the GeoIP feature downloads these files).
+mkdir -p "$VPSSEC_STATE_DIR/geo"
+printf '9.9.9.0/24\n' > "$VPSSEC_STATE_DIR/geo/NL.cidr"
+rm -f "$VPSSEC_STATE_DIR/pending-alerts.list" "$VPSSEC_STATE_DIR/alerts.log"
+bash "$HERE/lib/alerts.sh" --report ip 9.9.9.4 22 "45 new connections in 30s" > "$SANDBOX/report.out" 2>&1 || true
+check "report queues the offending IP"    "grep -qE '^[0-9]+\|ip\|9.9.9.4\|' '$VPSSEC_STATE_DIR/pending-alerts.list'"
+check "notification names the port"       "grep -q 'port 22' '$SANDBOX/report.out'"
+check "notification says nothing is blocked" "grep -q 'Nothing was blocked' '$SANDBOX/report.out'"
+check "notification points at the reviewer" "grep -q 'vpssec alerts' '$SANDBOX/report.out'"
+check "report is recorded in alerts.log"  "grep -q 'DETECTED ip 9.9.9.4' '$VPSSEC_STATE_DIR/alerts.log'"
+
+if python3 -c 'print(1)' >/dev/null 2>&1; then
+    check "country is resolved offline"    "[ \"$(bash "$HERE/lib/alerts.sh" --get 1 | cut -d'|' -f4)\" = \"NL\" ]"
+    check "describe names the country"     "bash "$HERE/lib/alerts.sh" --describe 1 | grep -q 'Netherlands'"
+    check "geoip.sh --cc-name works"       "[ \"$(bash "$HERE/lib/geoip.sh" --cc-name NL)\" = \"netherlands\" ]"
+else
+    echo "  skip- country lookup (python3 not available)"
+fi
+
+# The login notice is the notification the admin cannot miss
+MOTD="$(VPSSEC_STATE_DIR="$VPSSEC_STATE_DIR" bash "$HERE/scripts/motd-alerts.sh" 2>&1 || true)"
+check "login notice reports the count"   "printf '%s' \"\$MOTD\" | grep -q '1 suspicious network event'"
+check "login notice names the offender"  "printf '%s' \"\$MOTD\" | grep -q '9.9.9.4'"
+check "login notice says nothing is blocked" "printf '%s' \"\$MOTD\" | grep -q 'nothing is blocked yet'"
+check "login notice tells how to review" "printf '%s' \"\$MOTD\" | grep -q 'vpssec alerts'"
+rm -f "$VPSSEC_STATE_DIR/pending-alerts.list"
+MOTD_EMPTY="$(VPSSEC_STATE_DIR="$VPSSEC_STATE_DIR" bash "$HERE/scripts/motd-alerts.sh" 2>&1 || true)"
+check "login notice is silent when clear" "[ -z \"\$(printf '%s' \"\$MOTD_EMPTY\" | tr -d '[:space:]')\" ]"
+rm -rf "$VPSSEC_STATE_DIR/geo"
+
+echo
+echo "=== smoke: approval refuses to queue normal traffic ==="
+# allow-listed / tunnel / loopback / private targets must never reach the queue
+printf '2222\n3333\n443\n8443\n' > "$VPSSEC_CONF_DIR/allowed-ports.list"
+printf '8080\n' > "$VPSSEC_CONF_DIR/tunnel-ports.list"
+rm -f "$VPSSEC_STATE_DIR/pending-alerts.list"
+bash "$HERE/lib/alerts.sh" --report port 443   443   "allowed port"       >/dev/null 2>&1 || true
+bash "$HERE/lib/alerts.sh" --report port 8080  8080  "tunnel port"        >/dev/null 2>&1 || true
+bash "$HERE/lib/alerts.sh" --report ip 10.0.0.5 22   "private peer"       >/dev/null 2>&1 || true
+bash "$HERE/lib/alerts.sh" --report ip 127.0.0.1 22  "loopback"           >/dev/null 2>&1 || true
+check "allowed port is never queued"     "! grep -qE '\|port\|443\|' '$VPSSEC_STATE_DIR/pending-alerts.list'"
+check "tunnel port is never queued"      "! grep -qE '\|port\|8080\|' '$VPSSEC_STATE_DIR/pending-alerts.list'"
+check "private peer is never queued"     "! grep -qE '\|ip\|10.0.0.5\|' '$VPSSEC_STATE_DIR/pending-alerts.list'"
+check "loopback is never queued"         "! grep -qE '\|ip\|127.0.0.1\|' '$VPSSEC_STATE_DIR/pending-alerts.list'"
+check "skips are logged, not silent"     "grep -q 'SKIP allowed port 443' '$VPSSEC_STATE_DIR/alerts.log'"
 
 echo
 echo "=== smoke: guard API ==="
@@ -360,8 +472,8 @@ check "status shows allowed count"      "grep -q 'Allowed ports' '$SANDBOX/statu
 echo
 echo
 echo "=== smoke: blocked list view ==="
-# ensure one port is blocked, then render the blocked view
-UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --scan >/dev/null 2>&1
+# Block one port the way an approval does, then render the blocked view.
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --block-now 9999 >/dev/null 2>&1
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" blocked > "$SANDBOX/blocked.out" 2>&1 || true
 check "blocked view lists port 9999"    "grep -q 'port *9999' '$SANDBOX/blocked.out'"
 check "blocked view shows countdown"    "grep -q 'unblocks in' '$SANDBOX/blocked.out'"
@@ -395,13 +507,18 @@ check "fallback menu shows banner"      "grep -q 'vps-security' '$SANDBOX/menu.o
 check "fallback menu lists scan option" "grep -q 'Scan for rogue ports now' '$SANDBOX/menu.out'"
 check "fallback menu lists blocked"     "grep -q 'View blocked ports' '$SANDBOX/menu.out'"
 check "fallback menu lists update"      "grep -q 'Update vps-security' '$SANDBOX/menu.out'"
+check "fallback menu lists alerts"     "grep -q 'Pending alerts' '$SANDBOX/menu.out'"
 
-# menu-driven blocked view: pick option 6 then exit (0)
-printf '6\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menu2.out" 2>&1 || true
-check "menu option 6 shows blocked view" "grep -q 'Blocked Ports' '$SANDBOX/menu2.out'"
+# menu-driven alert queue: option 6 (empty queue prints the all-clear)
+printf '6\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menu-alerts.out" 2>&1 || true
+check "menu option 6 opens the alert queue" "grep -q 'Pending Alerts' '$SANDBOX/menu-alerts.out'"
 
-# menu-driven unblock: option 7 with a blocked port present
-printf '7\n1\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menu3.out" 2>&1 || true
+# menu-driven blocked view: option 7, then exit (0)
+printf '7\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menu2.out" 2>&1 || true
+check "menu option 7 shows blocked view" "grep -q 'Blocked Ports' '$SANDBOX/menu2.out'"
+
+# menu-driven unblock: option 8 with a blocked port present
+printf '8\n1\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menu3.out" 2>&1 || true
 check "menu unblock releases port"      "grep -q 'unblocked' '$SANDBOX/menu3.out'"
 
 echo
@@ -546,6 +663,19 @@ if command -v script >/dev/null 2>&1; then
         fi
         check "setup finishes and enters the menu"  "grep -q 'Setup finished' '$SANDBOX/ptymenu.out'"
         check "install opens the menu on a terminal" "grep -q 'Main Menu' '$SANDBOX/ptymenu.out'"
+
+        # The heart of the approval model: the admin is ASKED before anything
+        # is firewalled, and only "y" applies the ban.
+        rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/pending-alerts.list"
+        bash "$HERE/lib/alerts.sh" --report port 9876 9876 "rogue service carrying traffic" >/dev/null 2>&1 || true
+        printf 'y\nq\n' | TERM=xterm timeout 30 \
+            script -qec "bash '$HERE/vpssec' alerts" /dev/null > "$SANDBOX/ptyapprove.out" 2>&1 || true
+        check "approval prompt asks the admin to decide" "grep -q 'Block port 9876' '$SANDBOX/ptyapprove.out'"
+        check "approval prompt offers y/n/s/a/q"         "grep -q 'y = yes' '$SANDBOX/ptyapprove.out'"
+        check "approval applies the block on y"          "grep -q 'deny 9876/tcp' '$SANDBOX/ufw.log'"
+        check "approved block is recorded"               "grep -qE '\|9876$' '$VPSSEC_STATE_DIR/blocked-ports.list'"
+        check "approval clears the queue"                "[ \"$(bash "$HERE/lib/alerts.sh" --count)\" -eq 0 ]"
+        UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" unblock 9876 >/dev/null 2>&1 || true
     else
         echo "  skip- pty menu check (pty harness did not feed input here)"
     fi
@@ -598,20 +728,47 @@ rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
 check "disabled shield never bans (zombie guard)" "! grep -q 'deny from' '$SANDBOX/ufw.log'"
 
-# ---- tunnel safety: never ban the server's own or the admin's peers ----
+check "shield conf records the approval mode" "grep -q 'SHIELD_MODE=approve' '$VPSSEC_CONF_DIR/botshield.conf'"
+check "shield conf records the 24h ban window" "grep -q 'BAN_SECONDS=86400' '$VPSSEC_CONF_DIR/botshield.conf'"
+check "shield output explains detection"      "grep -q 'for your approval' '$SANDBOX/shield.out'"
+
+# ---- approval model: a flood is REPORTED, never banned by the machine ----
 printf 'GEO_ENABLED=0\nGEO_COUNTRIES=\nGEO_BYPASS=198.51.100.7\n' > "$VPSSEC_CONF_DIR/geo.conf"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --enable "443" > /dev/null 2>&1 || true
-rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/shield-bans.list"
-# a real attacker on 443 gets banned
-SS_SYN_FLOOD=203.0.113.9 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
-check "SYN flood from a public IP is banned" "grep -q 'deny from 203.0.113.9' '$SANDBOX/ufw.log'"
-# a private peer is never banned (that is the tunnel talking to itself)
+rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/shield-bans.list" "$VPSSEC_STATE_DIR/pending-alerts.list" "$VPSSEC_STATE_DIR/alerts.log"
+SS_SYN_FLOOD=203.0.113.9 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --maint > "$SANDBOX/flood.out" 2>&1 || true
+check "SYN flood is reported, not banned"   "grep -qE '^[0-9]+\|ip\|203.0.113.9\|' '$VPSSEC_STATE_DIR/pending-alerts.list'"
+check "no ban happens without approval"     "! grep -q 'deny from 203.0.113.9' '$SANDBOX/ufw.log'"
+check "no ban entry without approval"       "! [ -s '$VPSSEC_STATE_DIR/shield-bans.list' ]"
+check "flood detection is logged"           "grep -q 'DETECT 203.0.113.9' '$VPSSEC_STATE_DIR/shield.log'"
+check "admin is notified of the flood"      "grep -q 'Suspicious activity detected' '$SANDBOX/flood.out'"
+# a private peer is never even reported (that is the tunnel talking to itself)
 SS_SYN_FLOOD=10.0.0.9 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
-check "private peer is never banned"        "! grep -q 'deny from 10.0.0.9' '$SANDBOX/ufw.log'"
-# a declared trusted peer (GeoIP bypass) is never banned either
+check "private peer is never reported"      "! grep -qE '^[0-9]+\|ip\|10.0.0.9\|' '$VPSSEC_STATE_DIR/pending-alerts.list'"
+# a declared trusted peer (GeoIP bypass) is never reported either
 SS_SYN_FLOOD=198.51.100.7 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
-check "trusted peer is never banned"        "! grep -q 'deny from 198.51.100.7' '$SANDBOX/ufw.log'"
-check "skipped bans are logged"             "grep -q 'SKIP-BAN 10.0.0.9' '$VPSSEC_STATE_DIR/shield.log' && grep -q 'SKIP-BAN 198.51.100.7' '$VPSSEC_STATE_DIR/shield.log'"
+check "trusted peer is never reported"      "! grep -qE '^[0-9]+\|ip\|198.51.100.7\|' '$VPSSEC_STATE_DIR/pending-alerts.list'"
+check "skipped peers are logged"            "grep -q 'SKIP local/private peer 10.0.0.9' '$VPSSEC_STATE_DIR/alerts.log' && grep -q 'SKIP trusted peer 198.51.100.7' '$VPSSEC_STATE_DIR/alerts.log'"
+check "only the public attacker is queued"  "[ \"$(bash "$HERE/lib/alerts.sh" --count)\" -eq 1 ]"
+# approving the alert is what bans the IP — for 24 hours
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" alerts approve 1 > "$SANDBOX/alertban.out" 2>&1 || true
+check "approval bans the reported IP"       "grep -q 'deny from 203.0.113.9' '$SANDBOX/ufw.log'"
+check "approved ban is recorded"            "grep -qE '203.0.113.9$' '$VPSSEC_STATE_DIR/shield-bans.list'"
+check "approved ban is logged"              "grep -q 'BAN 203.0.113.9' '$VPSSEC_STATE_DIR/shield-bans.log'"
+check "approval says how long the ban lasts" "grep -q 'banned for 24h' '$SANDBOX/alertban.out'"
+check "queue is empty after approval"       "[ \"$(bash "$HERE/lib/alerts.sh" --count)\" -eq 0 ]"
+# and it can be released immediately — mistakes stay recoverable
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" shield unban 203.0.113.9 > "$SANDBOX/unban-approve.out" 2>&1 || true
+check "an approved ban can be released"     "grep -q 'delete deny from 203.0.113.9' '$SANDBOX/ufw.log' && ! grep -q '203.0.113.9' '$VPSSEC_STATE_DIR/shield-bans.list'"
+# MODE=auto restores the old fully-automatic banning
+sed -i 's/^SHIELD_MODE=.*/SHIELD_MODE=auto/' "$VPSSEC_CONF_DIR/botshield.conf"
+rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/pending-alerts.list"
+SS_SYN_FLOOD=203.0.113.11 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
+check "MODE=auto bans immediately again"    "grep -q 'deny from 203.0.113.11' '$SANDBOX/ufw.log'"
+check "MODE=auto queues no alert"           "! [ -s '$VPSSEC_STATE_DIR/pending-alerts.list' ]"
+sed -i 's/^SHIELD_MODE=.*/SHIELD_MODE=approve/' "$VPSSEC_CONF_DIR/botshield.conf"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --disable > /dev/null 2>&1 || true
 
 echo
@@ -745,11 +902,11 @@ check "boot restore keeps safe geo rules"    "grep -q 'vps-security geoip BEGIN'
 
 echo
 echo "=== smoke: new menu commands present ==="
-printf '10\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menumaint.out" 2>&1 || true
+printf '11\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menumaint.out" 2>&1 || true
 check "menu shows maint entry"          "grep -q 'Maintenance' '$SANDBOX/menumaint.out'"
-printf '11\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menushield.out" 2>&1 || true
+printf '12\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menushield.out" 2>&1 || true
 check "menu shows shield entry"         "grep -q 'Bot & Scanner Shield' '$SANDBOX/menushield.out'"
-printf '12\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menugeo.out" 2>&1 || true
+printf '13\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menugeo.out" 2>&1 || true
 check "menu shows geo entry"            "grep -q 'GeoIP Country Filter' '$SANDBOX/menugeo.out'"
 bash "$HERE/vpssec" geo list > "$SANDBOX/geocmd.out" 2>&1 || true
 check "vpssec geo list works"           "grep -q 'GeoIP country filter' '$SANDBOX/geocmd.out'"
@@ -774,6 +931,7 @@ check "uninstall removes shield conf"        "[ ! -f '$VPSSEC_CONF_DIR/botshield
 check "uninstall wipes state dir"            "[ ! -d '$VPSSEC_STATE_DIR' ] || [ -z \"\$(ls -A '$VPSSEC_STATE_DIR' 2>/dev/null)\" ]"
 check "uninstall removes systemd units"      "[ ! -f '$VPSSEC_SYSTEMD_DIR/vps-security-monitor.timer' ] && [ ! -f '$VPSSEC_SYSTEMD_DIR/vps-security-geo.timer' ]"
 check "uninstall removes maint timer"        "[ ! -f '$VPSSEC_SYSTEMD_DIR/vps-security-maint.timer' ]"
+check "uninstall removes the login notice"   "[ ! -f '$SANDBOX/motd/99-vps-security-alerts' ]"
 check "uninstall removes install dir"        "[ ! -d '$SANDBOX/opt/vps-security' ]"
 
 echo

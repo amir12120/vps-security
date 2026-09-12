@@ -265,9 +265,11 @@ check "iran: ssh port recorded for monitor" "grep -q 'MONITOR_SELF_PORT=22' '$H_
 # ------------------------------------------------------------
 echo
 echo "=== sim: monitor scan on the FOREIGN server ==="
-rm -f "$ROOT/foreign/logs/ufw.log" "$H_foreign/state/blocked-ports.list"
+rm -f "$ROOT/foreign/logs/ufw.log" "$H_foreign/state/blocked-ports.list" "$H_foreign/state/pending-alerts.list"
 on foreign bash "$HERE/lib/monitor.sh" --scan > "$ROOT/foreign/scan.out" 2>&1 || true
-check "foreign: rogue 4444 blocked"            "grep -q 'deny 4444/tcp' '$ROOT/foreign/logs/ufw.log'"
+check "foreign: rogue 4444 is reported, not blocked" "grep -qE '^[0-9]+\|port\|4444\|' '$H_foreign/state/pending-alerts.list'"
+check "foreign: nothing is blocked without approval" "! grep -q 'deny 4444' '$ROOT/foreign/logs/ufw.log'"
+check "foreign: the admin is notified"         "grep -q 'Suspicious activity detected' '$ROOT/foreign/scan.out'"
 check "foreign: tunnel 8443 NOT blocked"       "! grep -q 'deny 8443' '$ROOT/foreign/logs/ufw.log'"
 check "foreign: panel 2087 NOT blocked"        "! grep -q 'deny 2087' '$ROOT/foreign/logs/ufw.log'"
 check "foreign: subscriptions 2096 NOT blocked" "! grep -q 'deny 2096' '$ROOT/foreign/logs/ufw.log'"
@@ -275,18 +277,32 @@ check "foreign: loopback forward NOT blocked"  "! grep -q 'deny 18080' '$ROOT/fo
 check "foreign: inbound tunnel peer NOT blocked" "! grep -q 'deny 51234' '$ROOT/foreign/logs/ufw.log'"
 check "foreign: scan names the tunnel ports"   "grep -q 'tunnel: 8443' '$H_foreign/state/monitor.log'"
 check "foreign: panel never lands in the block list" "! grep -qE '\|2087$|\|2096$|\|8443$' '$H_foreign/state/blocked-ports.list'"
+check "foreign: panel/tunnel is never even reported" "! grep -qE '\|(2087|2096|8443)\|' '$H_foreign/state/pending-alerts.list'"
+# approving is what blocks it — never the machine's own guess
+on foreign bash "$HERE/vpssec" alerts approve 1 > "$ROOT/foreign/approve.out" 2>&1 || true
+check "foreign: approved rogue port is blocked"      "grep -q 'deny 4444/tcp' '$ROOT/foreign/logs/ufw.log'"
+check "foreign: approved block recorded"             "grep -qE '^[0-9]+\|4444$' '$H_foreign/state/blocked-ports.list'"
+check "foreign: approval is logged"                  "grep -q 'APPROVED port 4444' '$H_foreign/state/alerts.log'"
 
 echo
 echo "=== sim: monitor scan on the IRAN server ==="
-rm -f "$ROOT/iran/logs/ufw.log" "$H_iran/state/blocked-ports.list"
+rm -f "$ROOT/iran/logs/ufw.log" "$H_iran/state/blocked-ports.list" "$H_iran/state/pending-alerts.list"
 on iran bash "$HERE/lib/monitor.sh" --scan > "$ROOT/iran/scan.out" 2>&1 || true
-check "iran: rogue 3389 blocked"               "grep -q 'deny 3389' '$ROOT/iran/logs/ufw.log'"
+check "iran: rogue 3389 is reported, not blocked" "grep -qE '^[0-9]+\|port\|3389\|' '$H_iran/state/pending-alerts.list'"
+check "iran: nothing is blocked without approval" "! grep -q 'deny 3389' '$ROOT/iran/logs/ufw.log'"
 check "iran: tunnel entry 443 NOT blocked"     "! grep -q 'deny 443' '$ROOT/iran/logs/ufw.log'"
 check "iran: OUTBOUND tunnel source port NOT blocked" "! grep -q 'deny 51234' '$ROOT/iran/logs/ufw.log'"
 check "iran: tunneled panel (loopback) NOT blocked"   "! grep -q 'deny 2087' '$ROOT/iran/logs/ufw.log'"
 check "iran: monitor API port NOT blocked"     "! grep -q 'deny 18080' '$ROOT/iran/logs/ufw.log'"
 check "iran: ssh 22 NOT blocked"               "! grep -q 'deny 22/' '$ROOT/iran/logs/ufw.log'"
-check "iran: block is recorded with a timestamp" "grep -qE '^[0-9]+\|3389$' '$H_iran/state/blocked-ports.list'"
+check "iran: alert is recorded with a timestamp" "grep -qE '^[0-9]+\|port\|3389\|' '$H_iran/state/pending-alerts.list'"
+# the tunnel entry is the customer-facing port of a live shop: approving
+# the alert must block the rogue port and leave 443 untouched
+on iran bash "$HERE/vpssec" alerts approve 1 > "$ROOT/iran/approve.out" 2>&1 || true
+check "iran: approved rogue 3389 is blocked"   "grep -q 'deny 3389' '$ROOT/iran/logs/ufw.log'"
+check "iran: approved block recorded"          "grep -qE '^[0-9]+\|3389$' '$H_iran/state/blocked-ports.list'"
+check "iran: approval is logged"               "grep -q 'APPROVED port 3389' '$H_iran/state/alerts.log'"
+check "iran: approval left the tunnel alone"   "! grep -q 'deny 443' '$ROOT/iran/logs/ufw.log'"
 
 # ------------------------------------------------------------
 # 3. Bot & Scanner shield must never rate-limit a tunnel
@@ -300,20 +316,29 @@ check "iran: shield enabled"                   "grep -q 'Shield enabled' '$ROOT/
 check "iran: ssh 22 is rate-limited"           "grep -q 'limit 22/tcp' '$ROOT/iran/logs/ufw.log'"
 check "iran: tunnel entry 443 NOT rate-limited" "! grep -q 'limit 443/' '$ROOT/iran/logs/ufw.log'"
 check "iran: shield conf excludes the tunnel"  "grep -q 'SHIELD_ENABLED=1' '$H_iran/etc/botshield.conf'"
-# a real attacker brute-forcing SSH is banned
-rm -f "$ROOT/iran/logs/ufw.log" "$H_iran/state/shield-bans.list"
+# a real attacker brute-forcing SSH is REPORTED, never banned automatically
+rm -f "$ROOT/iran/logs/ufw.log" "$H_iran/state/shield-bans.list" "$H_iran/state/pending-alerts.list"
 SS_SYN_FLOOD="$ATTACKER" SS_SYN_FLOOD_PORT=22 on iran bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
-check "iran: ssh brute-forcer is banned"      "grep -q 'deny from $ATTACKER' '$ROOT/iran/logs/ufw.log'"
+check "iran: ssh brute-forcer is reported, not banned" "grep -qE '^[0-9]+\|ip\|$ATTACKER\|' '$H_iran/state/pending-alerts.list'"
+check "iran: no ban without approval"          "! grep -q 'deny from $ATTACKER' '$ROOT/iran/logs/ufw.log'"
+# the admin approves → 24h ban, still releasable at any time
+on iran bash "$HERE/vpssec" alerts approve 1 > "$ROOT/iran/approve-ban.out" 2>&1 || true
+check "iran: approved IP ban is applied"       "grep -q 'deny from $ATTACKER' '$ROOT/iran/logs/ufw.log'"
+check "iran: approved ban is recorded"         "grep -qE '$ATTACKER$' '$H_iran/state/shield-bans.list'"
+check "iran: approved ban is logged"           "grep -q 'BAN $ATTACKER' '$H_iran/state/shield-bans.log'"
+on iran bash "$HERE/vpssec" shield unban "$ATTACKER" > /dev/null 2>&1 || true
+check "iran: an approved ban can be released"  "! grep -q '$ATTACKER' '$H_iran/state/shield-bans.list'"
 # a flood aimed at the tunnel entry must never be treated as an attack:
 # one busy tunnel peer legitimately looks like a flood
-rm -f "$ROOT/iran/logs/ufw.log" "$H_iran/state/shield-bans.list"
+rm -f "$ROOT/iran/logs/ufw.log" "$H_iran/state/shield-bans.list" "$H_iran/state/pending-alerts.list"
 SS_SYN_FLOOD="$ATTACKER" SS_SYN_FLOOD_PORT=443 on iran bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
-check "iran: tunnel traffic is never mistaken for an attack" "! grep -q 'deny from $ATTACKER' '$ROOT/iran/logs/ufw.log'"
-# the tunnel peer itself (GeoIP-trusted) is never banned
-rm -f "$ROOT/iran/logs/ufw.log"
+check "iran: tunnel traffic is never mistaken for an attack" "! grep -q 'deny from $ATTACKER' '$ROOT/iran/logs/ufw.log' && ! grep -qE '^[0-9]+\|ip\|' '$H_iran/state/pending-alerts.list'"
+# the tunnel peer itself (GeoIP-trusted) is never reported either
+rm -f "$ROOT/iran/logs/ufw.log" "$H_iran/state/pending-alerts.list"
 SS_SYN_FLOOD="$FOREIGN_IP" SS_SYN_FLOOD_PORT=22 on iran bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
 check "iran: trusted tunnel peer is never banned" "! grep -q 'deny from $FOREIGN_IP' '$ROOT/iran/logs/ufw.log'"
-check "iran: skip is logged for the peer"      "grep -q 'SKIP-BAN $FOREIGN_IP' '$H_iran/state/shield.log'"
+check "iran: trusted tunnel peer is never reported" "! grep -qE '^[0-9]+\|ip\|' '$H_iran/state/pending-alerts.list'"
+check "iran: skip is logged for the peer"      "grep -q 'SKIP trusted peer $FOREIGN_IP' '$H_iran/state/alerts.log'"
 
 on foreign bash "$HERE/lib/botshield.sh" --enable "22" > "$ROOT/foreign/shield.out" 2>&1 || true
 check "foreign: shield enabled"                "grep -q 'Shield enabled' '$ROOT/foreign/shield.out'"

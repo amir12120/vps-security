@@ -9,7 +9,7 @@
 #
 # Endpoints:
 #   GET /health   -> {"status":"ok"}
-#   GET /status   -> allowed ports, block list, recent events
+#   GET /status   -> allowed ports, block list, pending alerts, events
 #
 # NOTE: This listener answers ONE request per connection, serially.
 # It is intentionally minimal; a future release may move it to Node.
@@ -53,13 +53,17 @@ build_status_json() {
     fi
     blocked+="]"
 
+    local pending_n=0
+    [ -f "$VPSSEC_STATE_DIR/pending-alerts.list" ] && \
+        pending_n="$(grep -cE '^[0-9]+\|' "$VPSSEC_STATE_DIR/pending-alerts.list" || true)"
+
     local events="[]"
     if [ -f "$BLOCK_LOG" ]; then
         events="$(tail -n 20 "$BLOCK_LOG" | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read().splitlines()))' 2>/dev/null || printf '[]')"
     fi
 
-    printf '{"status":"ok","allowed":%s,"blocked":%s,"events":%s}\n' \
-        "$allowed" "$blocked" "$events"
+    printf '{"status":"ok","allowed":%s,"blocked":%s,"pending_alerts":%s,"events":%s}\n' \
+        "$allowed" "$blocked" "${pending_n:-0}" "$events"
 }
 
 serve_one() {
@@ -145,6 +149,10 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/status":
             blocked = read_ports(os.path.join(STATE, "blocked-ports.list"), split_on_pipe=True)
             allowed = read_ports(os.path.join(CONF, "allowed-ports.list"))
+            # Suspicious events detected but NOT yet blocked: the approval
+            # model means this number can be non-zero while nothing is
+            # firewalled, which a dashboard must show separately.
+            pending = read_ports(os.path.join(STATE, "pending-alerts.list"))
             events = []
             log = os.path.join(STATE, "port-blocks.log")
             try:
@@ -152,7 +160,8 @@ class H(BaseHTTPRequestHandler):
                     events = f.read().splitlines()[-20:]
             except OSError:
                 pass
-            self._json(200, {"status": "ok", "allowed": allowed, "blocked": blocked, "events": events})
+            self._json(200, {"status": "ok", "allowed": allowed, "blocked": blocked,
+                             "pending_alerts": len(pending), "events": events})
         else:
             self._json(404, {"error": "not found"})
 
