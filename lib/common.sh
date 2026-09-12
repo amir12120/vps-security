@@ -10,7 +10,9 @@ if [ -t 1 ]; then
     GREEN='\033[0;32m'
     YELLOW='\033[1;33m'
     CYAN='\033[0;36m'
+    # shellcheck disable=SC2034
     BOLD='\033[1m'
+    # shellcheck disable=SC2034
     DIM='\033[2m'
     RESET='\033[0m'
 else
@@ -64,7 +66,8 @@ VPSSEC_SYSTEMD_DIR="${VPSSEC_SYSTEMD_DIR:-/etc/systemd/system}"
 # Where generated ufw 'before' rules live (overridable for sandbox tests)
 UFW_DIR="${UFW_DIR:-/etc/ufw}"
 # Path overridable for sandbox tests; consumed by lib/monitor.sh (and vpssec)
-MONITOR_CONF="$VPSSEC_CONF_DIR/monitor.conf"  # shellcheck disable=SC2034
+# shellcheck disable=SC2034
+MONITOR_CONF="$VPSSEC_CONF_DIR/monitor.conf"
 ALLOWED_PORTS_CONF="$VPSSEC_CONF_DIR/allowed-ports.list"
 BLOCK_LIST_FILE="$VPSSEC_STATE_DIR/blocked-ports.list"
 BLOCK_LOG="$VPSSEC_STATE_DIR/port-blocks.log"
@@ -74,6 +77,8 @@ BLOCK_LOG="$VPSSEC_STATE_DIR/port-blocks.log"
 # many connections, which looks exactly like an attack to `ufw limit`.
 TUNNEL_PORTS_CONF="$VPSSEC_CONF_DIR/tunnel-ports.list"
 # Client-side protocols that legitimately bind UDP sockets system-wide.
+# UDP client ports (DHCP, NTP, DHCPv6) that must never look like services
+# shellcheck disable=SC2034
 UDP_CLIENT_PORTS="67 68 123 546 547"
 
 ensure_dirs() {

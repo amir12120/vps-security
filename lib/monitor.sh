@@ -110,8 +110,12 @@ ufw_allowed_ports() {
 # Remove expired blocks (older than BLOCK_SECONDS)
 unblock_expired() {
     [ -f "$BLOCK_LIST_FILE" ] || return 0
-    local now ts port removed=0
+    local now ts port removed=0 keep tmp
     now="$(date +%s)"
+    # Collect the still-live entries FIRST, then rewrite the file once:
+    # rewriting inside the read loop would mutate the very file the loop is
+    # consuming (and `sed -i` replaces the inode mid-read).
+    tmp="$(mktemp)"
     while IFS='|' read -r ts port || [ -n "$ts" ]; do
         [ -z "${ts:-}" ] && continue
         port="${port:-}"
@@ -120,13 +124,20 @@ unblock_expired() {
                 ufw delete deny "$port"/tcp >/dev/null 2>&1 || true
                 ufw delete deny "$port"/udp >/dev/null 2>&1 || true
             fi
-            sed -i "/|${port}\$/d" "$BLOCK_LIST_FILE" 2>/dev/null || true
             log_action "UNBLOCK" "$port" "block window expired"
             removed=$((removed + 1))
+        else
+            printf '%s|%s\n' "$ts" "$port" >> "$tmp"
         fi
     done < "$BLOCK_LIST_FILE"
-    [ "$removed" -gt 0 ] && printf '%s unblocked %d expired port(s)\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "$removed" >> "$MONITOR_LOG"
+    if [ "$removed" -gt 0 ]; then
+        keep="$tmp"
+        mv "$keep" "$BLOCK_LIST_FILE"
+        printf '%s unblocked %d expired port(s)\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$removed" >> "$MONITOR_LOG"
+    else
+        rm -f "$tmp"
+    fi
     return 0
 }
 

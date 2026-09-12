@@ -46,7 +46,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 MIRROR_CONF="$VPSSEC_CONF_DIR/mirror.conf"
 MIRROR_LOG="$VPSSEC_STATE_DIR/mirror.log"
-GIT_CONFIG_DIR_DEFAULT="/etc"
 RESOLVED_CONF_D="${VPSSEC_RESOLVED_CONF_D:-/etc/systemd/resolved.conf.d}"
 RESOLV_CONF="${VPSSEC_RESOLV_CONF:-/etc/resolv.conf}"
 PROBE_REPO="${MIRROR_PROBE_REPO:-octocat/Hello-World}"
@@ -151,6 +150,7 @@ log_mirror() {
 
 load_mirror_conf() {
     MIRROR_NAME="" MIRROR_BASE="" DNS_NAME="" DNS_PRIMARY="" DNS_SECONDARY="" APT_MIRROR=""
+    # shellcheck disable=SC1090  # config file path is dynamic
     [ -f "$MIRROR_CONF" ] && . "$MIRROR_CONF" 2>/dev/null
     return 0
 }
@@ -372,6 +372,7 @@ apt_codename() {
     fi
     local cn=""
     if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091  # os-release path is fixed at runtime
         cn="$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")"
     fi
     [ -n "$cn" ] || cn="$(lsb_release -sc 2>/dev/null || true)"

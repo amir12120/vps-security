@@ -23,7 +23,8 @@ GUARD_PORT="18080"
 GUARD_HOST="${GUARD_HOST:-127.0.0.1}"
 # Reserved for future bash-side request body handling; the Python server
 # (cmd_serve_py) enforces its own limits.
-MAX_BODY_BYTES=8192  # shellcheck disable=SC2034 # intentionally kept
+# shellcheck disable=SC2034
+MAX_BODY_BYTES=8192
 
 json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' '
@@ -66,6 +67,16 @@ build_status_json() {
         "$allowed" "$blocked" "${pending_n:-0}" "$events"
 }
 
+# Send one HTTP response over the connected fd. Kept in one place because
+# printf with a dynamic fd redirection plus `2>/dev/null` makes shellcheck
+# see two stderr redirections; the fd is always a valid socket here.
+respond() {
+    local fd="$1" status="$2" body="$3"
+    printf 'HTTP/1.1 %s\r\n' "$status" >&"$fd"
+    printf 'Content-Type: application/json\r\n' >&"$fd"
+    printf 'Content-Length: %s\r\n\r\n%s' "$(printf '%s' "$body" | wc -c)" "$body" >&"$fd"
+}
+
 serve_one() {
     # Read request headers (and discard any body)
     # shellcheck disable=SC2034  # req/method parsed for clarity; routing uses path
@@ -83,17 +94,12 @@ serve_one() {
             out="$(build_status_json)"
             ;;
         *)
-            out='{"error":"not found"}'
-            printf 'HTTP/1.1 404 Not Found\r\n' >&"$1" 2>/dev/null
-            printf 'Content-Type: application/json\r\n' >&"$1" 2>/dev/null
-            printf 'Content-Length: %s\r\n\r\n%s' "$(printf '%s' "$out" | wc -c)" "$out" >&"$1" 2>/dev/null
+            respond "$1" '404 Not Found' '{"error":"not found"}'
             return 0
             ;;
     esac
 
-    printf 'HTTP/1.1 200 OK\r\n' >&"$1" 2>/dev/null
-    printf 'Content-Type: application/json\r\n' >&"$1" 2>/dev/null
-    printf 'Content-Length: %s\r\n\r\n%s' "$(printf '%s' "$out" | wc -c)" "$out" >&"$1" 2>/dev/null
+    respond "$1" '200 OK' "$out"
 }
 
 cmd_serve() {

@@ -77,6 +77,7 @@ geo_enabled() { [ -f "$GEO_CONF" ] && grep -q '^GEO_ENABLED=1$' "$GEO_CONF" 2>/d
 load_geo_conf() {
     GEO_COUNTRIES=""
     GEO_BYPASS=""
+    # shellcheck disable=SC1090  # config file path is dynamic
     [ -f "$GEO_CONF" ] && . "$GEO_CONF" 2>/dev/null
     return 0
 }

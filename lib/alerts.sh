@@ -42,9 +42,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 ALERTS_FILE="$VPSSEC_STATE_DIR/pending-alerts.list"
 ALERT_LOG="$VPSSEC_STATE_DIR/alerts.log"
-SHIELD_CONF="$VPSSEC_CONF_DIR/botshield.conf"
 GEO_DIR="$VPSSEC_STATE_DIR/geo"
-IPSET_DIR="$VPSSEC_STATE_DIR/geo"
 
 # How long an approved ban lasts. 24 hours by default — long enough to
 # stop a campaign, short enough that a mistake is not permanent, and it
