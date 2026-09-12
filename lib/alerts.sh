@@ -50,6 +50,17 @@ GEO_DIR="$VPSSEC_STATE_DIR/geo"
 APPROVAL_BAN_SECONDS="${APPROVAL_BAN_SECONDS:-86400}"
 BLOCK_SECONDS="${BLOCK_SECONDS:-$APPROVAL_BAN_SECONDS}"
 BAN_SECONDS="${BAN_SECONDS:-$APPROVAL_BAN_SECONDS}"
+
+# The admin-configured windows in monitor.conf / botshield.conf are the
+# authority for how long an approved ban/block lasts; the modules reload
+# them at apply time, so read them here too for consistent reporting.
+load_duration_confs() {
+    [ -f "$VPSSEC_CONF_DIR/monitor.conf" ] && \
+        . "$VPSSEC_CONF_DIR/monitor.conf" 2>/dev/null || true
+    [ -f "$VPSSEC_CONF_DIR/botshield.conf" ] && \
+        . "$VPSSEC_CONF_DIR/botshield.conf" 2>/dev/null || true
+    return 0
+}
 # Alerts nobody acted on are forgotten after a week.
 ALERT_TTL_SECONDS="${ALERT_TTL_SECONDS:-604800}"
 ALERT_MAX_ENTRIES="${ALERT_MAX_ENTRIES:-200}"
@@ -315,14 +326,15 @@ alert_notify() {
 # Apply the punishment for an alert line. Returns 0 when it was applied.
 alert_apply() {
     local line="$1" kind target
+    load_duration_confs
     kind="$(alert_field "$line" kind)"
     target="$(alert_field "$line" target)"
     if [ "$kind" = "ip" ]; then
-        BAN_SECONDS="$BAN_SECONDS" bash "$SCRIPT_DIR/lib/botshield.sh" --ban-now "$target" \
+        bash "$SCRIPT_DIR/lib/botshield.sh" --ban-now "$target" \
             "approved by admin" || return 1
         ok "IP $target banned for $((BAN_SECONDS / 3600))h. Release early: sudo vpssec shield unban"
     else
-        BLOCK_SECONDS="$BLOCK_SECONDS" bash "$SCRIPT_DIR/lib/monitor.sh" --block-now "$target" \
+        bash "$SCRIPT_DIR/lib/monitor.sh" --block-now "$target" \
             "approved by admin" || return 1
         ok "Port $target blocked for $((BLOCK_SECONDS / 3600))h. Release early: sudo vpssec unblock $target"
     fi

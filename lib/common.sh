@@ -77,9 +77,14 @@ BLOCK_LOG="$VPSSEC_STATE_DIR/port-blocks.log"
 # many connections, which looks exactly like an attack to `ufw limit`.
 TUNNEL_PORTS_CONF="$VPSSEC_CONF_DIR/tunnel-ports.list"
 # Client-side protocols that legitimately bind UDP sockets system-wide.
+# Shared command wrappers: every library funnels ufw/systemctl/ipset/curl
+# through these so sandboxed tests can stub them via PATH.
+cmd_ipset()     { ipset "$@"; }
+cmd_ufw()       { ufw "$@"; }
+cmd_systemctl() { systemctl "$@"; }
+cmd_curl()      { curl -fsSL --max-time 120 "$@"; }
+
 # UDP client ports (DHCP, NTP, DHCPv6) that must never look like services
-# shellcheck disable=SC2034
-UDP_CLIENT_PORTS="67 68 123 546 547"
 
 ensure_dirs() {
     mkdir -p "$VPSSEC_CONF_DIR" "$VPSSEC_STATE_DIR"

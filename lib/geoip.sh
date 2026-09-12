@@ -63,11 +63,6 @@ BEFORE_RULES="$UFW_DIR/before.rules"
 MARK_BEGIN="# --- vps-security geoip BEGIN ---"
 MARK_END="# --- vps-security geoip END ---"
 
-cmd_ipset()     { ipset "$@"; }
-cmd_ufw()       { ufw "$@"; }
-cmd_systemctl() { systemctl "$@"; }
-cmd_curl()      { curl -fsSL --max-time 120 "$@"; }
-
 have_ipset() { command -v ipset >/dev/null 2>&1; }
 
 # ---------- conf ----------

@@ -32,7 +32,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.7.0 — server hardening toolkit
+  vps-security v1.7.1 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────

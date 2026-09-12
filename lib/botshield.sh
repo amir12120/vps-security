@@ -36,8 +36,6 @@ BAN_SECONDS="${BAN_SECONDS:-86400}"    # 24 hours default
 BAN_THRESHOLD="${BAN_THRESHOLD:-40}"   # alerts/bans raised when hits exceed this
 SHIELD_MODE="${SHIELD_MODE:-approve}"  # approve | auto
 
-cmd_ufw()       { ufw "$@"; }
-cmd_systemctl() { systemctl "$@"; }
 have_iptables() { command -v iptables >/dev/null 2>&1; }
 
 # ---------- conf ----------
@@ -206,16 +204,27 @@ unban_ip() {
 
 unban_expired() {
     [ -f "$BANS_FILE" ] || return 0
-    local now ts ip removed=0
+    local now ts ip removed=0 keep tmp
     now="$(date +%s)"
+    # Decide first, rewrite once: unban_ip mutates the very file this loop
+    # reads (same hazard ShellCheck flagged in the port monitor).
+    tmp="$(mktemp)"
     while IFS='|' read -r ts ip || [ -n "${ts:-}" ]; do
         [ -z "${ts:-}" ] && continue
         if [ $((now - ts)) -ge "$BAN_SECONDS" ]; then
             unban_ip "$ip"
             removed=$((removed + 1))
+        else
+            printf '%s|%s\n' "$ts" "$ip" >> "$tmp"
         fi
     done < "$BANS_FILE"
-    [ "$removed" -gt 0 ] && printf '%s expired bans removed: %d\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$removed" >> "$SHIELD_LOG"
+    if [ "$removed" -gt 0 ]; then
+        keep="$tmp"
+        mv "$keep" "$BANS_FILE"
+        printf '%s expired bans removed: %d\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$removed" >> "$SHIELD_LOG"
+    else
+        rm -f "$tmp"
+    fi
     return 0
 }
 
@@ -432,6 +441,9 @@ case "${1:-}" in
         IP="${1:-}"
         printf '%s' "$IP" | grep -qE '^[0-9a-fA-F.:]+$' || die "invalid IP"
         need_root
+        # The admin-configured ban window is the authority; an env override
+        # (approval path) still wins so approve/report stay consistent.
+        load_shield_conf
         ban_ip "$IP" "${2:-approved by admin}"
         # Never claim a ban that was refused (local/private or trusted peer):
         # the approval path must report failure so the alert stays queued.
@@ -442,7 +454,7 @@ case "${1:-}" in
             exit 1
         fi
         ;;
-    --maint)   need_root; unban_expired; scan_and_ban ;;
+    --maint)   need_root; load_shield_conf; unban_expired; scan_and_ban ;;
     --health)  shield_is_enabled ;;
     *) die "usage: botshield.sh (--enable [ports]|--disable|--status|--list|--unban <ip>|--ban-now <ip>|--maint|--health)" ;;
 esac

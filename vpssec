@@ -69,7 +69,7 @@ fi
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.7.0"
+VERSION="1.7.1"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
 REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
 REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"
@@ -1296,6 +1296,17 @@ cmd_update() {
     chmod +x "$TARGET_DIR/vpssec" "$TARGET_DIR"/lib/*.sh "$TARGET_DIR"/scripts/*.sh "$TARGET_DIR"/test/*.sh 2>/dev/null || true
     ln -sf "$TARGET_DIR/vpssec" /usr/local/bin/vpssec
     ok "Updated: $before → $after."
+    # The systemd units execute from the installed copy in $INSTALL_DIR, not
+    # from the git checkout — refresh it too, otherwise the timers would keep
+    # running the OLD code after an update.
+    if [ -d "$TARGET_DIR/lib" ] && [ -d "$(dirname "$INSTALL_DIR")" ]; then
+        mkdir -p "$INSTALL_DIR"
+        rm -rf "$INSTALL_DIR/lib"
+        cp -r "$TARGET_DIR/lib" "$INSTALL_DIR/"
+        chmod 755 "$INSTALL_DIR/lib/"*.sh
+        install_motd   # the login notice ships in scripts/ — keep it current
+        ok "Runtime copy refreshed in $INSTALL_DIR."
+    fi
     if [ -x "$TARGET_DIR/lib/monitor.sh" ]; then
         $SYSTEMCTL restart vps-security-guard.service 2>/dev/null || true
         $SYSTEMCTL restart vps-security-monitor.timer 2>/dev/null || true
@@ -1338,6 +1349,7 @@ cmd_uninstall() {
     $SYSTEMCTL disable --now vps-security-maint.timer 2>/dev/null || true
     $SYSTEMCTL disable --now vps-security-shield.timer 2>/dev/null || true
     $SYSTEMCTL disable --now vps-security-geo.timer 2>/dev/null || true
+    $SYSTEMCTL disable --now vps-security-geo-guard.timer 2>/dev/null || true
     $SYSTEMCTL stop vps-security-guard.service 2>/dev/null || true
     "$SCRIPT_DIR/lib/botshield.sh" --disable >/dev/null 2>&1 || true
     "$SCRIPT_DIR/lib/geoip.sh" --disable >/dev/null 2>&1 || true
@@ -1370,6 +1382,7 @@ cmd_uninstall() {
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-guard.service
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-shield.{service,timer}
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-geo.{service,timer}
+    rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-geo-guard.{service,timer}
     $SYSTEMCTL daemon-reload
     remove_motd
     rm -rf "$VPSSEC_CONF_DIR" "$VPSSEC_STATE_DIR"

@@ -254,6 +254,9 @@ run_scan() {
 block_port_now() {
     local port="$1" reason="${2:-approved by admin}"
     is_valid_port "$port" || die "usage: monitor.sh --block-now <port> [reason]"
+    # The admin-configured block window is the authority; an env override
+    # (approval path) still wins so approve/report stay consistent.
+    load_monitor_conf
     block_port "$port" "$reason"
     # Never claim a block that was skipped (own control ports, missing ufw):
     # the approval path must report failure so the alert stays queued.
