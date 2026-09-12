@@ -67,7 +67,7 @@ fi
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
 REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
 REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"
@@ -102,8 +102,18 @@ BANNER
 
 ui_line() { echo -e "  ${DIM}─────────────────────────────────────────────────────${RESET}"; }
 
+# Clear the screen for a fresh frame.
+# `clear` writes nothing (and reports success) under TERM=dumb, and fails
+# outright when TERM is unset, so fall back to the raw ANSI erase sequence.
+ui_clear() {
+    if [ -n "${TERM:-}" ] && command -v clear >/dev/null 2>&1 && clear 2>/dev/null; then
+        return 0
+    fi
+    printf '\033[H\033[2J' 2>/dev/null || true
+}
+
 ui_title() {
-    clear 2>/dev/null || true
+    ui_clear
     ui_header
     echo -e "  ${BOLD}${CYAN}$1${RESET}"
     ui_line
@@ -134,13 +144,14 @@ ui_menu() {
         return 0
     fi
 
-    # Arrow-key mode
-    ui_title "$title"
+    # Arrow-key mode. Every frame is a FULL redraw from a cleared screen.
+    # A partial redraw (cursor-home plus rewriting only the menu lines) leaves
+    # the taller banner's leftover glyphs on screen, so the menu ends up
+    # overlapping the logo.
     while :; do
-        local i row=$((2))
-        printf "\033[H" 2>/dev/null || true
+        ui_title "$title"
+        local i line
         for i in "${!items[@]}"; do
-            local marker="${DIM} ${RESET}" color="" line
             line="${items[$i]}"
             if [ "$i" -eq "$sel" ]; then
                 printf "  ${GREEN}❯ ${BOLD}%s${RESET}\n" "$line"
@@ -149,7 +160,6 @@ ui_menu() {
             fi
         done
         printf "\n  ${DIM}↑/↓ move · Enter select · q back${RESET}\n"
-        printf "\033[%dA" "$((n + 2))" 2>/dev/null || true
         IFS= read -rsn1 key
         case "$key" in
             $'\x1b')   # escape sequence

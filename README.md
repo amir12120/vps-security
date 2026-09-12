@@ -31,7 +31,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.4.0 — server hardening toolkit
+  vps-security v1.4.1 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────
@@ -215,7 +215,8 @@ It stays local-only by default — do not expose it publicly without an authenti
 Nothing here touches the machine it runs on: `ufw`, `ss`, `systemctl`, `apt-get`, `ipset` and `curl` are `PATH`-stubbed and every path is redirected into a temp sandbox.
 
 ```bash
-bash test/smoke.sh              # 195 checks: full install, monitor, block expiry, shield, GeoIP, maintenance, mirror/DNS, symlinked CLI, uninstall
+bash test/smoke.sh              # 198 checks: full install, monitor, block expiry, shield, GeoIP, maintenance, mirror/DNS, symlinked CLI, TUI frames, uninstall
+                                # (a Linux host adds the pty menu checks and the live guard API checks)
 bash test/simulate-two-host.sh  #  59 checks: two simulated servers (Iran + foreign) with a 3x-ui panel and a backpack tunnel
 ```
 

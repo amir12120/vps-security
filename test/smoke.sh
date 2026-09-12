@@ -487,6 +487,18 @@ else
 fi
 
 echo
+echo "=== smoke: TUI frame rendering (source guards) ==="
+# The pty check below needs Linux `script`; these guards hold everywhere and
+# pin the exact regression that made the menu overlap the banner logo: a
+# partial redraw (cursor-home + rewrite) instead of a full cleared frame.
+PARTIAL=$(grep -c '\[%dA' "$HERE/vpssec" || true)
+check "menu has no partial cursor-up redraw"    "[ \"${PARTIAL:-0}\" -eq 0 ]"
+CLEAR_FN=$(grep -c '^ui_clear()' "$HERE/vpssec" || true)
+check "TUI defines a screen-clear helper"       "[ \"${CLEAR_FN:-0}\" -eq 1 ]"
+FRAME_CLEAR=$(awk '/^ui_menu\(\) \{/,/^\}/' "$HERE/vpssec" | grep -c 'ui_title "\$title"')
+check "every menu frame redraws the full header" "[ \"${FRAME_CLEAR:-0}\" -ge 1 ]"
+
+echo
 echo "=== smoke: guided install ends in the TUI menu (pty) ==="
 if command -v script >/dev/null 2>&1; then
     # Start from a clean port list so the guided setup takes its short
@@ -508,6 +520,17 @@ if command -v script >/dev/null 2>&1; then
     else
         echo "  skip- pty menu check (pty harness did not feed input here)"
     fi
+    # Regression: navigating the menu must redraw a COMPLETE frame. The old
+    # partial redraw (cursor-home + rewriting just the menu lines) left the
+    # taller banner's leftover glyphs on screen, so the menu items ended up
+    # overlapping the logo. One down-arrow = 2 frames, every one re-printing
+    # the header; a partial redraw would print it only once.
+    printf '\033[Bq\n' | TERM=xterm timeout 30 \
+        script -qec "bash '$HERE/vpssec'" /dev/null > "$SANDBOX/ptyframes.out" 2>&1 || true
+    FRAMES=$(grep -c 'vps-security v' "$SANDBOX/ptyframes.out" || true)
+    check "menu redraws a full frame on every key" "[ \"${FRAMES:-0}\" -ge 2 ]"
+    CURSOR_UP=$(grep -cE $'\033\[[0-9]+A' "$SANDBOX/ptyframes.out" || true)
+    check "menu never redraws in place (no cursor-up)" "[ \"${CURSOR_UP:-0}\" -eq 0 ]"
 else
     echo "  skip- pty menu check (no 'script' command)"
 fi

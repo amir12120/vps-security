@@ -31,7 +31,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.4.0 — server hardening toolkit
+  vps-security v1.4.1 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────
@@ -216,7 +216,8 @@ curl http://127.0.0.1:18080/status   # پورت‌های مجاز، مسدود �
 هیچ‌کدام از تست‌ها به سرور واقعی دست نمی‌زنند: دستورهای `ufw`، `ss`، `systemctl`، `apt-get`، `ipset` و `curl` با استاب (stub) شبیه‌سازی می‌شوند و همه مسیرها به یک سندباکس موقت هدایت می‌شوند.
 
 ```bash
-bash test/smoke.sh              # ۱۹۵ چک: نصب کامل، مانیتور، انقضای بلاک، سپر، GeoIP، نگهداری، میرور/DNS، CLI از مسیر symlink، حذف کامل
+bash test/smoke.sh              # ۱۹۸ چک: نصب کامل، مانیتور، انقضای بلاک، سپر، GeoIP، نگهداری، میرور/DNS، CLI از مسیر symlink، فریم‌های TUI، حذف کامل
+                                # (روی سرور لینوکسی چک‌های منو روی pty و API زنده هم اضافه می‌شوند)
 bash test/simulate-two-host.sh  # ۵۹ چک: دو سرور شبیه‌سازی‌شده (ایران + خارج) با پنل 3x-ui و تانل backpack
 ```
 
