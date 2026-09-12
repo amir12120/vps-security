@@ -1049,9 +1049,13 @@ action_alerts() {
         fi
         printf "${DIM}[y = yes · n = no, dismiss · s = skip · a = approve all · q = stop]${RESET} "
         read -r action
+        # A failed approve/dismiss must never loop forever on the same entry.
         case "$action" in
-            [Yy]*)  bash "$SCRIPT_DIR/lib/alerts.sh" --approve "$pos" || true ;;
-            [Nn]*)  bash "$SCRIPT_DIR/lib/alerts.sh" --dismiss "$pos" || true ;;
+            [Yy]*)  bash "$SCRIPT_DIR/lib/alerts.sh" --approve "$pos" || {
+                        warn "Could not apply that ban — it stays queued for later."
+                        pos=$((pos + 1))
+                    } ;;
+            [Nn]*)  bash "$SCRIPT_DIR/lib/alerts.sh" --dismiss "$pos" || pos=$((pos + 1)) ;;
             [Aa]*)  bash "$SCRIPT_DIR/lib/alerts.sh" --approve-all ; break ;;
             [Qq])   break ;;
             *)      info "Skipped — it stays in the queue for later."

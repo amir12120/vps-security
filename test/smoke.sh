@@ -357,6 +357,13 @@ check "auto mode raises no alert"         "! [ -s '$VPSSEC_STATE_DIR/pending-ale
 check "monitor status reports the mode"   "bash '$HERE/lib/monitor.sh' --status | grep -q 'Mode *: *approve\|Mode *: *auto'"
 sed -i 's/^MONITOR_MODE=.*/MONITOR_MODE=approve/' "$VPSSEC_CONF_DIR/monitor.conf"
 
+# an approval must never claim a block that was actually skipped
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --block-now 3333 > "$SANDBOX/blockown.out" 2>&1
+BLOCK_OWN_RC=$?
+check "block-now refuses the SSH port"     "[ \"$BLOCK_OWN_RC\" -ne 0 ] && grep -q 'was NOT blocked' '$SANDBOX/blockown.out'"
+check "refused block writes no ufw rule"   "! grep -q 'deny 3333' '$SANDBOX/ufw.log'"
+
 echo
 echo "=== smoke: CLI unblock ==="
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" unblock 9999 > /dev/null 2>&1
@@ -780,6 +787,14 @@ check "queue is empty after approval"       "[ \"$(bash "$HERE/lib/alerts.sh" --
 rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" shield unban 203.0.113.9 > "$SANDBOX/unban-approve.out" 2>&1 || true
 check "an approved ban can be released"     "grep -q 'delete deny from 203.0.113.9' '$SANDBOX/ufw.log' && ! grep -q '203.0.113.9' '$VPSSEC_STATE_DIR/shield-bans.list'"
+# an approval must never claim a ban the shield actually refused
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --ban-now 10.0.0.5 > "$SANDBOX/bannow.out" 2>&1
+BAN_NOW_RC=$?
+check "ban-now refuses a private peer"     "[ \"$BAN_NOW_RC\" -ne 0 ]"
+check "refusal is reported, not hidden"    "grep -q 'was NOT banned' '$SANDBOX/bannow.out'"
+check "refused ban writes no ufw rule"     "! grep -q 'deny from 10.0.0.5' '$SANDBOX/ufw.log'"
+
 # MODE=auto restores the old fully-automatic banning
 sed -i 's/^SHIELD_MODE=.*/SHIELD_MODE=auto/' "$VPSSEC_CONF_DIR/botshield.conf"
 rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/pending-alerts.list"

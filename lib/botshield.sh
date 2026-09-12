@@ -433,7 +433,14 @@ case "${1:-}" in
         printf '%s' "$IP" | grep -qE '^[0-9a-fA-F.:]+$' || die "invalid IP"
         need_root
         ban_ip "$IP" "${2:-approved by admin}"
-        ok "IP $IP banned for $((BAN_SECONDS / 3600))h."
+        # Never claim a ban that was refused (local/private or trusted peer):
+        # the approval path must report failure so the alert stays queued.
+        if [ -f "$BANS_FILE" ] && grep -qF "|$IP" "$BANS_FILE" 2>/dev/null; then
+            ok "IP $IP banned for $((BAN_SECONDS / 3600))h."
+        else
+            warn "IP $IP was NOT banned (local/private or trusted peer) — nothing was applied."
+            exit 1
+        fi
         ;;
     --maint)   need_root; unban_expired; scan_and_ban ;;
     --health)  shield_is_enabled ;;

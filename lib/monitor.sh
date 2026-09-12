@@ -244,7 +244,14 @@ block_port_now() {
     local port="$1" reason="${2:-approved by admin}"
     is_valid_port "$port" || die "usage: monitor.sh --block-now <port> [reason]"
     block_port "$port" "$reason"
-    ok "Port $port blocked for $((BLOCK_SECONDS / 3600))h."
+    # Never claim a block that was skipped (own control ports, missing ufw):
+    # the approval path must report failure so the alert stays queued.
+    if port_is_blocked "$port"; then
+        ok "Port $port blocked for $((BLOCK_SECONDS / 3600))h."
+    else
+        warn "Port $port was NOT blocked (own control port or firewall unavailable)."
+        return 1
+    fi
 }
 
 # Manual unblock (CLI)
