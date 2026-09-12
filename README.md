@@ -268,7 +268,7 @@ It stays local-only by default — do not expose it publicly without an authenti
 Nothing here touches the machine it runs on: `ufw`, `ss`, `systemctl`, `apt-get`, `ipset` and `curl` are `PATH`-stubbed and every path is redirected into a temp sandbox.
 
 ```bash
-bash test/smoke.sh              # 266 checks: full install, alert detection + approval, ban expiry, shield, GeoIP, maintenance, mirror/DNS, symlinked CLI, TUI frames, uninstall
+bash test/smoke.sh              # 274 checks: full install, alert detection + approval, ban expiry, shield, GeoIP, maintenance, mirror/DNS, symlinked CLI, TUI frames, uninstall
                                 # (a Linux host adds the pty menu checks, the interactive y/n approval and the live guard API checks)
 bash test/simulate-two-host.sh  #  76 checks: two simulated servers (Iran + foreign) with a 3x-ui panel and a backpack tunnel
 ```
