@@ -69,7 +69,7 @@ fi
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 INSTALL_DIR="${VPSSEC_INSTALL_DIR:-/usr/local/share/vps-security}"
 REPO_RAW="${VPSSEC_REPO_RAW:-https://raw.githubusercontent.com/amir12120/vps-security/main}"
 REPO_URL="${VPSSEC_REPO_URL:-https://github.com/amir12120/vps-security.git}"
@@ -1405,15 +1405,24 @@ Commands:
   mirror       Best Iranian mirror & DNS (best / test / apt / apt-test /
                reset / status) — fastest GitHub mirror, DNS and apt mirror
   shield       Bot & Scanner Shield (enable / disable / status)
-  geo          Country filter (add / remove / list / names / enable / disable / bypass / refresh)
+  geo          Country allow-LIST (only these countries may connect):
+               add / remove / list / names / enable / confirm / panic /
+               disable / bypass / refresh
+  rescue       Remove every block this toolkit added (use from the provider
+               console if you are ever locked out)
   logs         Show monitor log
   uninstall    Remove vps-security completely
   help         Show this help
 
 Tunnelled servers: declare every tunnel / VPN / proxy port with
-'sudo vpssec tunnels add <port>' so the monitor and the shield leave it
-alone. The GeoIP filter only drops NEW inbound connections, so outbound
+'sudo vpssec tunnels add <port>' so the monitor, the shield and the country
+filter all leave it alone. The GeoIP filter only drops NEW inbound
+connections from countries that are not on the allow-list, so outbound
 tunnels keep working from any country.
+
+Cannot reach the server after enabling the country allow-list?
+  1. WAIT $((${GEO_CONFIRM_SECONDS:-600} / 60)) minutes — an unconfirmed change removes itself.
+  2. Or from the provider console:  sudo vpssec rescue
 
 Every command is also available from the menu. The TUI uses arrow keys;
 over a plain pipe it falls back to a numbered menu automatically.
@@ -1644,13 +1653,14 @@ cmd_shield() {
 
 action_geo_menu() {
     while :; do
-        ui_menu "GeoIP Country Filter" \
-            "➕ Add allowed countries" \
-            "➖ Remove allowed countries" \
-            "📋 Show configuration" \
-            "✅ Enable filtering" \
-            "⛔ Disable filtering" \
-            "🛟 Never block an IP (bypass)" \
+        ui_menu "GeoIP country allow-list — only these countries may connect" \
+            "➕ Add a country that is ALLOWED to connect" \
+            "➖ Remove a country from the allowed list" \
+            "📋 Show configuration (who can connect)" \
+            "✅ Enable — block every country not on the list" \
+            "✔️  Confirm a change (keeps it active)" \
+            "⛔ Disable — let every country connect again" \
+            "🛟 Never block my current connecting IP" \
             "♻️  Refresh country lists" \
             "📖 Country codes & names (lookup)" \
             "🚪 Back"
@@ -1658,14 +1668,35 @@ action_geo_menu() {
             1) action_geo_add; ui_press_any_key ;;
             2) action_geo_remove; ui_press_any_key ;;
             3) bash "$SCRIPT_DIR/lib/geoip.sh" --list; ui_press_any_key ;;
-            4) bash "$SCRIPT_DIR/lib/geoip.sh" --enable; ui_press_any_key ;;
-            5) bash "$SCRIPT_DIR/lib/geoip.sh" --disable; ui_press_any_key ;;
-            6) action_geo_bypass; ui_press_any_key ;;
-            7) bash "$SCRIPT_DIR/lib/geoip.sh" --refresh; ui_press_any_key ;;
-            8) bash "$SCRIPT_DIR/lib/geoip.sh" --names; ui_press_any_key ;;
-            0|9) return 0 ;;
+            4) action_geo_enable; ui_press_any_key ;;
+            5) bash "$SCRIPT_DIR/lib/geoip.sh" --confirm; ui_press_any_key ;;
+            6) bash "$SCRIPT_DIR/lib/geoip.sh" --disable; ui_press_any_key ;;
+            7) action_geo_bypass; ui_press_any_key ;;
+            8) bash "$SCRIPT_DIR/lib/geoip.sh" --refresh; ui_press_any_key ;;
+            9) bash "$SCRIPT_DIR/lib/geoip.sh" --names; ui_press_any_key ;;
+            0|10) return 0 ;;
         esac
     done
+}
+
+# Enabling the allow-list is the one action that can lock the admin out, so
+# it states the consequence in plain words and keeps the safety net visible.
+action_geo_enable() {
+    ui_title "Enable the country allow-list"
+    bash "$SCRIPT_DIR/lib/geoip.sh" --list
+    echo
+    info "THIS IS AN ALLOW-LIST: only the countries above will be able to connect."
+    info "Every other country is blocked — including your own, if it is not listed."
+    echo
+    info "Safety net: you get $((${GEO_CONFIRM_SECONDS:-600} / 60)) minutes to confirm."
+    info "If you lose SSH, do NOTHING and the filter removes itself again."
+    echo
+    prompt "Enable the allow-list now? [y/N] "
+    read -r ans
+    case "$ans" in
+        [Yy]|[Yy][Ee][Ss]) bash "$SCRIPT_DIR/lib/geoip.sh" --enable ;;
+        *) info "Cancelled — nothing changed, every country can still connect." ;;
+    esac
 }
 
 # ============================================================
@@ -1730,11 +1761,25 @@ action_geo_remove() {
 }
 
 action_geo_bypass() {
-    ui_title "Bypass — Never Geo-block an IP"
-    info "Your current public IP: $(curl -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || echo unknown)"
-    info "This IP will always be allowed, even from a blocked country."
-    prompt "IP or CIDR to always allow (empty = cancel): "
+    ui_title "Bypass — never block an IP"
+    # The IP that matters is the one you are CONNECTING from, not the
+    # server's own public IP (which an earlier version displayed here).
+    local client_ip=""
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        client_ip="${SSH_CONNECTION%% *}"
+    elif [ -n "${SSH_CLIENT:-}" ]; then
+        client_ip="${SSH_CLIENT%% *}"
+    fi
+    if [ -n "$client_ip" ]; then
+        info "You are connected from: $client_ip"
+        info "That address will always be allowed, even from a blocked country."
+        prompt "IP or CIDR to always allow (empty = use $client_ip): "
+    else
+        info "Could not detect the IP you are connected from (local console?)."
+        prompt "IP or CIDR to always allow (empty = cancel): "
+    fi
     read -r ip
+    [ -z "$ip" ] && ip="$client_ip"
     [ -z "$ip" ] && { info "Cancelled."; return 0; }
     bash "$SCRIPT_DIR/lib/geoip.sh" --bypass add "$ip"
 }
@@ -1743,7 +1788,9 @@ cmd_geo() {
     case "${1:-list}" in
         add)     need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --add "${2:-}" ;;
         remove)  need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --remove "${2:-}" ;;
-        enable)  need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --enable ;;
+        enable)  need_root; action_geo_enable ;;
+        confirm) need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --confirm ;;
+        panic)   need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --panic ;;
         disable) need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --disable ;;
         refresh) need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --refresh ;;
         bypass)  need_root; bash "$SCRIPT_DIR/lib/geoip.sh" --bypass "${2:-add}" "${3:-}" ;;
@@ -1751,6 +1798,56 @@ cmd_geo() {
         list)    bash "$SCRIPT_DIR/lib/geoip.sh" --list ;;
         *)       bash "$SCRIPT_DIR/lib/geoip.sh" --list ;;
     esac
+}
+
+# ============================================================
+# Rescue — undo every network block this toolkit applied
+# ============================================================
+# The command you run from a provider's web console when you are locked out
+# and cannot SSH in. It removes the country allow-list, releases every port
+# the monitor blocked, and turns the shield off — leaving the server exactly
+# as reachable as it was before vps-security touched the firewall.
+cmd_rescue() {
+    need_root
+    ui_title "Rescue — remove every block this toolkit added"
+    warn "Run this from the provider console when SSH is not answering."
+    echo
+
+    info "[1/4] Removing the country allow-list..."
+    bash "$SCRIPT_DIR/lib/geoip.sh" --panic || true
+    echo
+
+    info "[2/4] Releasing every port blocked by the port monitor..."
+    local released=0 p
+    if [ -f "$BLOCK_LIST_FILE" ]; then
+        while IFS='|' read -r _stamp p; do
+            [ -z "$p" ] && continue
+            if bash "$SCRIPT_DIR/lib/monitor.sh" --unblock "$p" >/dev/null 2>&1; then
+                released=$((released + 1))
+            fi
+        done < "$BLOCK_LIST_FILE"
+    fi
+    ok "$released blocked port(s) released."
+    echo
+
+    info "[3/4] Turning the Bot & Scanner Shield off (and clearing its bans)..."
+    bash "$SCRIPT_DIR/lib/botshield.sh" --disable >/dev/null 2>&1 || true
+    ok "Shield disabled."
+    echo
+
+    info "[4/4] Making sure the SSH port stays open..."
+    local sshp
+    sshp="$(grep -E '^[[:space:]]*Port[[:space:]]+' "$SSH_CFG" 2>/dev/null | tail -1 | awk '{print $2}')"
+    [ -n "$sshp" ] || sshp=22
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow "$sshp/tcp" >/dev/null 2>&1 || true
+        ufw reload >/dev/null 2>&1 || true
+    fi
+    ok "SSH port $sshp/tcp is allowed."
+    echo
+    ok "Done — every block has been removed. Try connecting again."
+    info "The port monitor keeps running, but it only REPORTS now; nothing is blocked without your approval."
+    info "Re-enable anything you want with:  vpssec geo enable  /  vpssec shield enable"
 }
 
 # ============================================================
@@ -1771,9 +1868,11 @@ case "${1:-}" in
     update)    cmd_update ;;
     logs)      shift; cmd_logs "$@" ;;
     uninstall) cmd_uninstall ;;
-    shield)    shift; cmd_shield "$@" ;;        geo)     shift; cmd_geo "$@" ;;
+    shield)    shift; cmd_shield "$@" ;;
+    geo)       shift; cmd_geo "$@" ;;
     maint)     shift; cmd_maint "$@" ;;
     mirror)    shift; cmd_mirror "$@" ;;
+    rescue)    cmd_rescue ;;
     help|-h|--help) cmd_help ;;
     version|--version) echo "vpssec $VERSION" ;;
     *) die "Unknown command: $1 (try 'vpssec help')" ;;

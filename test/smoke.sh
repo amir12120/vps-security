@@ -151,7 +151,37 @@ chmod +x "$STUBS/ss"
 
 # ---------- stubs: sshd / systemctl / apt-get ----------
 printf '#!/usr/bin/env bash\nexit 0\n' > "$STUBS/sshd"; chmod +x "$STUBS/sshd"
-printf '#!/usr/bin/env bash\necho "ipset $*" >> "${IPSET_LOG:-/tmp/ipset.log}"\nexit 0\n' > "$STUBS/ipset"; chmod +x "$STUBS/ipset"
+# ipset stub. `create`/`destroy`/`add`/`list` are stateful so a set that was
+# never populated can be told apart from a populated one — that distinction is
+# what keeps the world-DROP rule from being installed over an empty allow-set.
+# `test` is realistic too: it only matches the fake range the country lists in
+# this suite contain, so the "is the admin's own IP covered?" logic can say no.
+cat > "$STUBS/ipset" <<'IPSEOF'
+#!/usr/bin/env bash
+echo "ipset $*" >> "${IPSET_LOG:-/tmp/ipset.log}"
+STORE="${IPSET_STORE:-/tmp/ipset-stub.store}"
+case "$1" in
+    test)    case "$3" in 1.2.3.*) exit 0 ;; *) exit 1 ;; esac ;;
+    create)  : > "$STORE"; exit 0 ;;
+    destroy) rm -f "$STORE"; exit 0 ;;
+    add)     [ -f "$STORE" ] || exit 1
+             # real ipset refuses anything that is not a range
+             case "$3" in *[!0-9./]*) exit 1 ;; esac
+             # lets a test pretend the kernel refused the entry
+             [ -n "${IPSET_ADD_FAIL:-}" ] && exit 1
+             grep -qx "$3" "$STORE" 2>/dev/null || echo "$3" >> "$STORE"
+             exit 0 ;;
+    list)    [ -f "$STORE" ] || exit 1
+             echo "Name: $2"
+             echo "Type: hash:net"
+             echo "Members:"
+             cat "$STORE"
+             exit 0 ;;
+esac
+exit 0
+IPSEOF
+chmod +x "$STUBS/ipset"
+export IPSET_STORE="$SANDBOX/ipset.store"; : > "$IPSET_STORE"
 
 cat > "$STUBS/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -916,6 +946,62 @@ UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --enable > "$SANDBOX/geosaf
 check "geo enable w/ failed downloads refuses" "grep -q 'NOT enabled' '$SANDBOX/geosafe2.out'"
 check "failed downloads write no DROP rule"    "! grep -q -- 'conntrack --ctstate NEW -j DROP' '$UFW_DIR/before.rules'"
 
+# b2) PARTIAL download -> refuse. This is the exact situation that locked an
+# admin out of a real server: Iran whitelisted, the IR list failed to come
+# down, the DE list succeeded, and the ruleset then allowed only Dutch IPs.
+printf 'GEO_ENABLED=0\nGEO_COUNTRIES=IR,DE\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+rm -f "$VPSSEC_STATE_DIR"/geo/*.cidr 2>/dev/null
+cat > "$STUBS/curl" <<'CEOF_PART'
+#!/usr/bin/env bash
+out="/dev/null"; prev=""
+for a in "$@"; do case "$prev" in -o) out="$a";; esac; prev="$a"; done
+case "$*" in
+    *IR.cidr*) printf '1.2.3.0/24\n' > "$out"; exit 0 ;;
+    *)         exit 1 ;;
+esac
+CEOF_PART
+chmod +x "$STUBS/curl"
+rm -f "$SANDBOX/ufw.log"
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --enable > "$SANDBOX/geopartial.out" 2>&1 || true
+check "geo enable w/ partial download refuses" "grep -q 'incomplete' '$SANDBOX/geopartial.out'"
+check "partial download names the failed CC"   "grep -q 'DE' '$SANDBOX/geopartial.out'"
+check "partial download writes no DROP rule"   "! grep -q -- 'conntrack --ctstate NEW -j DROP' '$UFW_DIR/before.rules'"
+check "partial download stays disabled"        "! grep -q '^GEO_ENABLED=1$' '$VPSSEC_CONF_DIR/geo.conf'"
+
+# b3) the range list downloads fine but NOTHING can be loaded into the ipset
+# (kernel module missing, memory refused the entries). The files on disk look
+# healthy, so a file-based safety check would happily install a ruleset that
+# DROP the whole world over an empty allow-set. The rebuild must refuse.
+cat > "$STUBS/curl" <<'CEOF_ADD'
+#!/usr/bin/env bash
+out="/dev/null"; prev=""
+for a in "$@"; do case "$prev" in -o) out="$a";; esac; prev="$a"; done
+printf '1.2.3.0/24\n' > "$out"
+exit 0
+CEOF_ADD
+chmod +x "$STUBS/curl"
+printf 'GEO_ENABLED=0\nGEO_COUNTRIES=IR\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+rm -f "$VPSSEC_STATE_DIR"/geo/*.cidr 2>/dev/null
+rm -f "$SANDBOX/ufw.log"
+IPSET_ADD_FAIL=1 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --enable > "$SANDBOX/geoempty.out" 2>&1 || true
+check "empty ipset refuses enable"          "grep -q 'allow-set is empty' '$SANDBOX/geoempty.out'"
+check "empty ipset writes no DROP rule"     "! grep -q -- 'conntrack --ctstate NEW -j DROP' '$UFW_DIR/before.rules'"
+check "empty ipset stays disabled"          "! grep -q '^GEO_ENABLED=1$' '$VPSSEC_CONF_DIR/geo.conf'"
+check "empty ipset keeps server reachable"  "grep -q 'ALL countries' '$SANDBOX/geoempty.out'"
+
+# b4) same situation at BOOT: the config is enabled and the list exists, but
+# the set cannot be rebuilt. A reboot must not silently re-install the
+# world-DROP rule (that is how a server stays locked out after a restart).
+printf 'GEO_ENABLED=1\nGEO_COUNTRIES=IR\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+printf '1.2.3.0/24\n' > "$VPSSEC_STATE_DIR/geo/IR.cidr"
+{ echo ""; echo "# --- vps-security geoip BEGIN ---"; echo "-A ufw-before-input ! -i lo -m conntrack --ctstate NEW -j DROP"; echo "# --- vps-security geoip END ---"; } >> "$UFW_DIR/before.rules"
+IPSET_ADD_FAIL=1 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --ipset-restore > /dev/null 2>&1 || true
+check "boot w/ empty ipset writes no DROP"  "! grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
+check "boot w/ empty ipset logs the reason" "grep -q 'SAFETY ipset rebuild empty at boot' '$VPSSEC_STATE_DIR/geo.log'"
+# ...and a healthy rebuild still restores the rules
+UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --ipset-restore > /dev/null 2>&1 || true
+check "boot w/ healthy ipset restores rules" "grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
+
 # c) removing the LAST country while enabled -> auto-disable + rules stripped
 cat > "$STUBS/curl" <<'CEOF3'
 #!/usr/bin/env bash
@@ -949,13 +1035,85 @@ UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/geoip.sh" --ipset-restore > /dev/null
 check "boot restore keeps safe geo rules"    "grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
 
 echo
+echo "=== smoke: GeoIP can never lock the admin out of SSH ==="
+# The whole point: an allow-list that does not cover the administrator's own
+# address must still leave them a way in. Four independent layers.
+cat > "$STUBS/curl" <<'CEOF_OK'
+#!/usr/bin/env bash
+out="/dev/null"; prev=""
+for a in "$@"; do case "$prev" in -o) out="$a";; esac; prev="$a"; done
+printf '1.2.3.0/24\n' > "$out"
+exit 0
+CEOF_OK
+chmod +x "$STUBS/curl"
+
+# layer 1 — the IP we are connected from is auto-allowed when its country is
+# not on the list (203.0.113.9 is not inside 1.2.3.0/24)
+printf 'GEO_ENABLED=0\nGEO_COUNTRIES=IR\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+printf '1.2.3.0/24\n' > "$VPSSEC_STATE_DIR/geo/IR.cidr"
+rm -f "$SANDBOX/ufw.log"
+SSH_CONNECTION="203.0.113.9 51000 10.0.0.1 22" UFW_LOG="$SANDBOX/ufw.log" \
+    bash "$HERE/lib/geoip.sh" --enable > "$SANDBOX/geoadmin.out" 2>&1 || true
+check "geo auto-allows the admin's SSH IP"  "grep -q 'GEO_BYPASS=203.0.113.9' '$VPSSEC_CONF_DIR/geo.conf'"
+check "admin IP written as an ACCEPT rule"  "grep -q -- '-s 203.0.113.9 -j ACCEPT' '$UFW_DIR/before.rules'"
+check "geo explains the auto-added IP"      "grep -q 'never-block list' '$SANDBOX/geoadmin.out'"
+
+# layer 2 — the confirmation window
+check "enable starts a confirm window"      "[ -f '$VPSSEC_STATE_DIR/geo-pending' ]"
+bash "$HERE/lib/geoip.sh" --confirm > "$SANDBOX/geoconfirm.out" 2>&1 || true
+check "confirm clears the window"           "[ ! -f '$VPSSEC_STATE_DIR/geo-pending' ]"
+check "confirm keeps the filter on"         "grep -q '^GEO_ENABLED=1$' '$VPSSEC_CONF_DIR/geo.conf'"
+
+# layer 3 — an unconfirmed change removes itself once the deadline passes
+printf '%s\n' "1" > "$VPSSEC_STATE_DIR/geo-pending"
+bash "$HERE/lib/geoip.sh" --confirm-check > "$SANDBOX/geoguard.out" 2>&1 || true
+check "expired window auto-disables"        "grep -q '^GEO_ENABLED=0$' '$VPSSEC_CONF_DIR/geo.conf'"
+check "expired window re-opens the server"  "! grep -q -- 'conntrack --ctstate NEW -j DROP' '$UFW_DIR/before.rules'"
+check "expired window clears the pending"   "[ ! -f '$VPSSEC_STATE_DIR/geo-pending' ]"
+
+# layer 4 — declared tunnel ports survive the allow-list
+printf 'GEO_ENABLED=0\nGEO_COUNTRIES=IR\nGEO_BYPASS=\n' > "$VPSSEC_CONF_DIR/geo.conf"
+printf '8443\n' > "$VPSSEC_CONF_DIR/tunnel-ports.list"
+rm -f "$SANDBOX/ufw.log"
+SSH_CONNECTION="203.0.113.9 51000 10.0.0.1 22" UFW_LOG="$SANDBOX/ufw.log" \
+    bash "$HERE/lib/geoip.sh" --enable > /dev/null 2>&1 || true
+check "tunnel port exempt from the filter"  "grep -q -- '-p tcp --dport 8443 -j ACCEPT' '$UFW_DIR/before.rules'"
+TUN_LINE="$(grep -n 'p tcp --dport 8443 -j ACCEPT' "$UFW_DIR/before.rules" | cut -d: -f1)"
+DRP_LINE="$(grep -n 'conntrack --ctstate NEW -j DROP' "$UFW_DIR/before.rules" | cut -d: -f1)"
+check "tunnel exemption sits before the DROP" \
+    "[ '${TUN_LINE:-0}' -lt '${DRP_LINE:-0}' ]"
+rm -f "$VPSSEC_CONF_DIR/tunnel-ports.list"
+
+# panic — the emergency exit, works from any console
+bash "$HERE/lib/geoip.sh" --panic > "$SANDBOX/geopanic.out" 2>&1 || true
+check "panic strips the geo rules"          "! grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
+check "panic disables the filter"           "grep -q '^GEO_ENABLED=0$' '$VPSSEC_CONF_DIR/geo.conf'"
+check "panic clears the confirm window"     "[ ! -f '$VPSSEC_STATE_DIR/geo-pending' ]"
+
+# rescue — the one command to run from a provider console when locked out
+bash "$HERE/vpssec" rescue > "$SANDBOX/rescue.out" 2>&1 || true
+check "rescue completes"                    "grep -q 'every block has been removed' '$SANDBOX/rescue.out'"
+check "rescue removes the country filter"   "! grep -q 'vps-security geoip BEGIN' '$UFW_DIR/before.rules'"
+check "rescue is listed in the help"        "bash '$HERE/vpssec' help 2>&1 | grep -q 'rescue'"
+
+# restore the plain country-list stub for the sections that follow
+cat > "$STUBS/curl" <<'CEOF_OK2'
+#!/usr/bin/env bash
+out="/dev/null"; prev=""
+for a in "$@"; do case "$prev" in -o) out="$a";; esac; prev="$a"; done
+printf '1.2.3.0/24\n' > "$out"
+exit 0
+CEOF_OK2
+chmod +x "$STUBS/curl"
+
+echo
 echo "=== smoke: new menu commands present ==="
 printf '11\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menumaint.out" 2>&1 || true
 check "menu shows maint entry"          "grep -q 'Maintenance' '$SANDBOX/menumaint.out'"
 printf '12\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menushield.out" 2>&1 || true
 check "menu shows shield entry"         "grep -q 'Bot & Scanner Shield' '$SANDBOX/menushield.out'"
 printf '13\n0\n0\n' | bash "$HERE/vpssec" > "$SANDBOX/menugeo.out" 2>&1 || true
-check "menu shows geo entry"            "grep -q 'GeoIP Country Filter' '$SANDBOX/menugeo.out'"
+check "menu shows geo entry"            "grep -q 'country allow-list' '$SANDBOX/menugeo.out'"
 bash "$HERE/vpssec" geo list > "$SANDBOX/geocmd.out" 2>&1 || true
 check "vpssec geo list works"           "grep -q 'GeoIP country filter' '$SANDBOX/geocmd.out'"
 bash "$HERE/vpssec" shield status > "$SANDBOX/shieldcmd.out" 2>&1 || true

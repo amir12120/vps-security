@@ -14,11 +14,28 @@
 #     else on all ports.
 #   - BYPASS_IPS in geo.conf are never blocked (your own IPs).
 #
+# THIS IS AN ALLOW-LIST. The countries you add are the ONLY ones that may
+# reach the server; every other country is dropped. It is NOT a list of
+# countries to block.
+#
+# SSH can never be locked out permanently, even if the allow-list is wrong:
+#   1. --enable refuses to run unless EVERY configured country has a
+#      downloaded range list. Accepting a partial download used to allow
+#      only whichever country happened to download — an instant lockout.
+#   2. the IP you are connected from right now is added to the bypass list
+#      automatically and checked against the ipset.
+#   3. a confirmation window: unless you run --confirm within
+#      GEO_CONFIRM_SECONDS (default 600) the filter removes itself and the
+#      server re-opens. Losing SSH is therefore temporary, not fatal.
+#   4. --panic removes the filter immediately, from any console.
+#
 # Usage:
 #   geoip.sh --add <XX,YY,...>      add countries (ISO 2-letter codes)
 #   geoip.sh --remove <XX,...>      remove countries
 #   geoip.sh --list                 show configured countries + set size
-#   geoip.sh --enable               apply the firewall rules
+#   geoip.sh --enable               apply the rules (starts the confirm window)
+#   geoip.sh --confirm              keep the change (stops the auto re-open)
+#   geoip.sh --panic                remove the filter right now (rescue)
 #   geoip.sh --disable              remove all geo rules
 #   geoip.sh --bypass add|remove|list [ip]
 #   geoip.sh --refresh              re-download CIDR lists
@@ -34,6 +51,13 @@ GEO_DIR="$VPSSEC_STATE_DIR/geo"
 GEO_LOG="$VPSSEC_STATE_DIR/geo.log"
 IPSET_NAME="vpssec_geo_allow"
 GEO_URL_BASE="${GEO_URL_BASE:-https://www.ipfire.org/geoip/country}"
+
+# Safety net: after a filter change the admin has this long to confirm it.
+# If they never do (because they lost SSH), the filter removes itself.
+GEO_CONFIRM_SECONDS="${GEO_CONFIRM_SECONDS:-600}"
+GEO_PENDING="$VPSSEC_STATE_DIR/geo-pending"
+GEO_GUARD_SERVICE="vps-security-geo-guard.service"
+GEO_GUARD_TIMER="vps-security-geo-guard.timer"
 
 BEFORE_RULES="$UFW_DIR/before.rules"
 MARK_BEGIN="# --- vps-security geoip BEGIN ---"
@@ -480,7 +504,7 @@ geo_download() {
         err "curl is required to download country lists."
         return 1
     fi
-    local cc file url
+    local cc file url missing=()
     for cc in $(echo "$GEO_COUNTRIES" | tr ',' ' '); do
         file="$GEO_DIR/$cc.cidr"
         url="$GEO_URL_BASE/$cc.cidr"
@@ -497,9 +521,19 @@ geo_download() {
             fi
         else
             rm -f "$file.tmp"
-            warn "  $cc: download failed (check internet access)"
+            # Never delete a good list because of one transient failure.
+            if [ -s "$file" ]; then
+                warn "  $cc: download failed — keeping the cached list"
+            else
+                warn "  $cc: download failed (check internet access)"
+            fi
         fi
+        [ -s "$file" ] || missing+=("$cc")
     done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        warn "No usable range list for: ${missing[*]}"
+        return 1
+    fi
     return 0
 }
 
@@ -522,20 +556,26 @@ geo_ipset_rebuild() {
             cmd_ipset add "$IPSET_NAME" "$ip" -exist 2>/dev/null || true
         done < "$GEO_DIR/$cc.cidr"
     done
-    ok "ipset $IPSET_NAME populated ($(cmd_ipset list "$IPSET_NAME" 2>/dev/null | grep -c '^[0-9]' || echo '?') entries)."
+    ok "ipset $IPSET_NAME populated ($(geo_ipset_count) entries)."
+    # If not a single range landed in the set, the rules that reference it
+    # would drop the whole world. Report a failed rebuild instead.
+    if [ "$(geo_ipset_count)" -eq 0 ]; then
+        err "ipset $IPSET_NAME is empty — no usable country ranges were loaded."
+        return 1
+    fi
     return 0
 }
 
 # ---------- before.rules block ----------
 
 # ---------- safety invariant ----------
-# The final-DROP rule must only ever be installed when the allow-set can
-# actually contain addresses (at least one non-empty country list, or at
-# least one bypass IP). Otherwise a config mistake or a failed download
-# would DROP THE WHOLE WORLD including the administrator's SSH session.
+# The final-DROP rule must only ever be installed when at least one
+# configured COUNTRY has a real range list. A bypass IP alone is not enough:
+# that would produce a ruleset that drops the whole world except one address,
+# which is exactly how an admin locks themselves out after their ISP
+# reassigns their IP.
 geo_ruleset_is_safe() {
     load_geo_conf
-    [ -n "${GEO_BYPASS:-}" ] && return 0
     local cc
     for cc in $(echo "${GEO_COUNTRIES:-}" | tr ',' ' '); do
         [ -s "$GEO_DIR/$cc.cidr" ] && return 0
@@ -543,15 +583,32 @@ geo_ruleset_is_safe() {
     return 1
 }
 
+# The rules consult the ipset, not the files, so "the files exist" is not
+# proof that the allow-set can actually hold an address. An empty set plus
+# the world-DROP rule is a lockout, so a set that could not be populated is
+# treated as a failed rebuild.
+geo_ipset_count() {
+    cmd_ipset list "$IPSET_NAME" 2>/dev/null | grep -c '^[0-9]'
+}
+
 geo_rules_text() {
-    local bypass=() ip
+    local bypass=() ip p
     [ -n "$GEO_BYPASS" ] && IFS=',' read -ra bypass <<< "$GEO_BYPASS"
+    # Declared tunnel / VPN / proxy ports must keep working with the country
+    # filter on: a reverse tunnel is dialled IN from abroad, so it arrives as
+    # a NEW connection from a country that may not be on the allow-list.
+    load_tunnel_ports
     cat <<EOF
 $MARK_BEGIN
-# geo filter: allow whitelisted countries, drop the rest
+# geo filter: allow ONLY the listed countries, drop the rest
 EOF
     for ip in "${bypass[@]:-}"; do
         [ -n "$ip" ] && echo "-A ufw-before-input -s $ip -j ACCEPT" || true
+    done
+    for p in "${TUNNEL_PORTS[@]:-}"; do
+        [ -n "$p" ] || continue
+        echo "-A ufw-before-input -p tcp --dport $p -j ACCEPT"
+        echo "-A ufw-before-input -p udp --dport $p -j ACCEPT"
     done
     cat <<EOF
 -A ufw-before-input -m set --match-set $IPSET_NAME src -j ACCEPT
@@ -599,6 +656,144 @@ geo_remove_rules() {
     return 0
 }
 
+# ---------- the administrator's own connection ----------
+
+geo_confirm_minutes() { printf '%s\n' "$((GEO_CONFIRM_SECONDS / 60))"; }
+
+# The IP the administrator is connecting FROM. This is the address that must
+# never be locked out — the server's own public IP is useless for that, which
+# is what an earlier version of the CLI wrongly displayed.
+geo_admin_client_ip() {
+    local ip=""
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        ip="${SSH_CONNECTION%% *}"
+    elif [ -n "${SSH_CLIENT:-}" ]; then
+        ip="${SSH_CLIENT%% *}"
+    fi
+    printf '%s\n' "$ip"
+}
+
+# Is this address allowed after the rules land (in the set, or bypassed)?
+geo_ip_allowed() {
+    local ip="$1"
+    [ -n "$ip" ] || return 1
+    case ",${GEO_BYPASS:-}," in *",$ip,"*) return 0 ;; esac
+    have_ipset || return 1
+    cmd_ipset test "$IPSET_NAME" "$ip" >/dev/null 2>&1
+}
+
+# Adds the current SSH client IP to the never-block list when it is not
+# already covered by an allowed country, and verifies the result.
+geo_protect_admin() {
+    local ip
+    ip="$(geo_admin_client_ip)"
+    if [ -z "$ip" ]; then
+        warn "Cannot see the IP you are connected from (running from a console?)."
+        warn "The $(geo_confirm_minutes)-minute confirmation window protects you instead."
+        return 0
+    fi
+    if geo_ip_allowed "$ip"; then
+        ok "Your current IP ($ip) is already allowed."
+        return 0
+    fi
+    GEO_BYPASS="${GEO_BYPASS:+$GEO_BYPASS,}$ip"
+    save_geo_conf
+    ok "Your current IP ($ip) is NOT in the allowed countries — added to the never-block list."
+    printf '%s BYPASS-AUTO %s (admin SSH client)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$ip" >> "$GEO_LOG"
+    return 0
+}
+
+# ---------- confirmation window (the anti-lockout guarantee) ----------
+
+geo_start_confirm_window() {
+    ensure_dirs
+    rm -f "$GEO_PENDING"
+    local now deadline
+    now="$(date +%s)"
+    deadline=$((now + GEO_CONFIRM_SECONDS))
+    printf '%s\n' "$deadline" > "$GEO_PENDING"
+    cat > "$VPSSEC_SYSTEMD_DIR/$GEO_GUARD_SERVICE" <<EOF
+[Unit]
+Description=vps-security GeoIP safety re-open (unconfirmed filter change)
+
+[Service]
+Type=oneshot
+ExecStart=$SCRIPT_DIR/lib/geoip.sh --confirm-check
+EOF
+    cat > "$VPSSEC_SYSTEMD_DIR/$GEO_GUARD_TIMER" <<EOF
+[Unit]
+Description=Re-open the server if a GeoIP change is never confirmed
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Unit=$GEO_GUARD_SERVICE
+
+[Install]
+WantedBy=timers.target
+EOF
+    cmd_systemctl daemon-reload >/dev/null 2>&1 || true
+    cmd_systemctl enable --now "$GEO_GUARD_TIMER" >/dev/null 2>&1 || true
+    printf '%s PENDING confirmation until %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$deadline" >> "$GEO_LOG"
+}
+
+geo_confirm() {
+    load_geo_conf
+    rm -f "$GEO_PENDING"
+    cmd_systemctl disable --now "$GEO_GUARD_TIMER" >/dev/null 2>&1 || true
+    rm -f "$VPSSEC_SYSTEMD_DIR/$GEO_GUARD_SERVICE" "$VPSSEC_SYSTEMD_DIR/$GEO_GUARD_TIMER"
+    cmd_systemctl daemon-reload >/dev/null 2>&1 || true
+    printf '%s CONFIRMED\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$GEO_LOG"
+    ok "Confirmed — the country filter stays active (it will no longer re-open by itself)."
+    ok "Allowed countries: $(echo "${GEO_COUNTRIES:-}" | tr ',' ' ')"
+    info "Changed your mind?  vpssec geo disable   (or the rescue command: vpssec rescue)"
+    return 0
+}
+
+# Run every minute by the guard timer. If the admin never confirmed the
+# change (they lost access) the filter is removed and the server re-opens.
+geo_confirm_check() {
+    load_geo_conf
+    geo_enabled || { rm -f "$GEO_PENDING"; return 0; }
+    [ -f "$GEO_PENDING" ] || return 0
+    local deadline now
+    deadline="$(tr -dc '0-9' < "$GEO_PENDING" 2>/dev/null)"
+    now="$(date +%s)"
+    case "$deadline$now" in *[!0-9]*|"") return 0 ;; esac
+    [ -n "$deadline" ] || return 0
+    if [ "$now" -ge "$deadline" ]; then
+        warn "GeoIP change was never confirmed — re-opening the server to all countries."
+        geo_disable
+        rm -f "$GEO_PENDING"
+        printf '%s SAFETY unconfirmed geo filter auto-disabled (server re-opened)\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" >> "$GEO_LOG"
+        ok "Run 'vpssec geo enable' again when you are sure your IP is covered."
+    fi
+    return 0
+}
+
+# Emergency: strip the country filter no matter what state the config is in.
+geo_panic() {
+    warn "Removing the country filter and re-opening the server to everyone..."
+    load_geo_conf
+    geo_remove_rules
+    cmd_ipset destroy "$IPSET_NAME" 2>/dev/null || true
+    rm -f "$GEO_PENDING"
+    cmd_systemctl disable --now "$GEO_GUARD_TIMER" >/dev/null 2>&1 || true
+    cmd_systemctl disable --now vps-security-geo.timer >/dev/null 2>&1 || true
+    rm -f "$VPSSEC_SYSTEMD_DIR/$GEO_GUARD_SERVICE" "$VPSSEC_SYSTEMD_DIR/$GEO_GUARD_TIMER" \
+          "$VPSSEC_SYSTEMD_DIR/vps-security-geo.service" "$VPSSEC_SYSTEMD_DIR/vps-security-geo.timer"
+    cmd_systemctl daemon-reload >/dev/null 2>&1 || true
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -qx 'Status: active'; then
+        cmd_ufw reload >/dev/null 2>&1 || true
+    fi
+    GEO_ENABLED=0
+    save_geo_conf
+    printf '%s PANIC geo filter removed\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$GEO_LOG"
+    ok "Country filter removed — the server is reachable from every country again."
+    return 0
+}
+
 # ---------- enable / disable ----------
 
 geo_enable() {
@@ -618,17 +813,39 @@ geo_enable() {
     fi
     have_ipset || die "ipset is required but not installed (apt-get install -y ipset)."
 
-    # ensure ipset present after reboot: install a restore service
-    geo_download || true
-    geo_ipset_rebuild || die "ipset rebuild failed."
-    # SAFETY: if the downloads failed, every allow-set is empty. Never write
-    # the world-DROP rule in that state.
+    # SAFETY 1: EVERY configured country must have a range list.
+    # A partial download used to be accepted, which produced a ruleset that
+    # allowed ONLY whichever country happened to download — so an admin in
+    # Iran who also whitelisted the Netherlands lost SSH the moment the IR
+    # download failed. Refuse to enable in that state.
+    if ! geo_download; then
+        geo_strip_if_unsafe || true
+        err "Country lists are incomplete (see the failures above) — geo filtering NOT enabled."
+        err "The server remains accessible from ALL countries. Re-run --enable when the downloads work."
+        return 1
+    fi
+    # SAFETY 2: never write the world-DROP rule with an empty allow-set.
+    # This covers a rebuild that produced no usable range (empty set = lockout).
+    if ! geo_ipset_rebuild; then
+        geo_remove_rules
+        cmd_ipset destroy "$IPSET_NAME" 2>/dev/null || true
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -qx 'Status: active'; then
+            cmd_ufw reload >/dev/null 2>&1 || true
+        fi
+        printf '%s SAFETY allow-set empty — geo rules removed, server open to all\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" >> "$GEO_LOG"
+        err "The allow-set is empty (no usable country ranges) — country filtering NOT enabled."
+        err "Country filtering NOT enabled — the server remains accessible from ALL countries."
+        return 1
+    fi
     if ! geo_ruleset_is_safe; then
         geo_strip_if_unsafe || true
         err "Country lists are empty (download failed?) — geo filtering NOT enabled."
         err "The server remains accessible from ALL countries. Fix internet access and re-run --enable."
         return 1
     fi
+    # SAFETY 3: allow the connection the administrator is using right now.
+    geo_protect_admin || true
     geo_write_rules || die "writing ufw rules failed."
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -qx 'Status: active'; then
         cmd_ufw reload >/dev/null 2>&1 || true
@@ -665,9 +882,14 @@ EOF
     GEO_ENABLED=1
     save_geo_conf
     printf '%s geo enabled (countries: %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$GEO_COUNTRIES" >> "$GEO_LOG"
-    ok "GeoIP filter ENABLED — only the configured countries can reach this server."
-    warn "Make sure your own IP is allowed (it is, if it is in a whitelisted country) —"
-    warn "otherwise add it with:  geoip.sh --bypass add <your-ip>"
+    # SAFETY 4: the confirmation window — if this connection dies, doing
+    # nothing re-opens the server by itself.
+    geo_start_confirm_window
+    ok "Country allow-list ENABLED — ONLY these countries can reach this server:"
+    ok "  $(echo "$GEO_COUNTRIES" | tr ',' ' ')"
+    info "Every other country is blocked now (allow-list, not a block-list)."
+    warn "SAFETY: confirm within $(geo_confirm_minutes) minutes:  vpssec geo confirm"
+    warn "If you lose SSH, just WAIT — the filter removes itself and the server re-opens."
 }
 
 geo_disable() {
@@ -677,7 +899,11 @@ geo_disable() {
         cmd_ufw reload >/dev/null 2>&1 || true
     fi
     cmd_systemctl disable --now vps-security-geo.timer 2>/dev/null || true
+    # a disabled filter must never leave a pending confirmation behind
+    cmd_systemctl disable --now "$GEO_GUARD_TIMER" 2>/dev/null || true
+    rm -f "$GEO_PENDING"
     rm -f "$VPSSEC_SYSTEMD_DIR"/vps-security-geo.{service,timer}
+    rm -f "$VPSSEC_SYSTEMD_DIR/$GEO_GUARD_SERVICE" "$VPSSEC_SYSTEMD_DIR/$GEO_GUARD_TIMER"
     cmd_systemctl daemon-reload
     cmd_ipset destroy "$IPSET_NAME" 2>/dev/null || true
     GEO_ENABLED=0
@@ -763,6 +989,9 @@ case "${1:-}" in
     --names)  cc_list_all ;;
     --cc-name) shift; cc_name "${1:-}" || true ;;
     --enable) need_root; geo_enable ;;
+    --confirm) need_root; geo_confirm ;;
+    --confirm-check) need_root; geo_confirm_check ;;
+    --panic) need_root; geo_panic ;;
     --disable) need_root; geo_disable ;;
     --bypass) shift; geo_bypass "${1:-}" "${2:-}" ;;
     --refresh) need_root; geo_refresh ;;
@@ -770,13 +999,35 @@ case "${1:-}" in
         # SAFETY at boot: if the on-disk config is unsafe (no countries /
         # empty lists / no bypass), remove any geo rules so the server is
         # never left blocked from the whole world after a reboot.
+        load_geo_conf
         if ! geo_ruleset_is_safe; then
             geo_strip_if_unsafe || true
             exit 0
         fi
-        geo_ipset_rebuild || true
-        geo_write_rules 2>/dev/null || true
+        # An unconfirmed change that already expired must not come back at
+        # boot — otherwise a reboot would re-lock a server the guard just
+        # re-opened.
+        if [ -f "$GEO_PENDING" ]; then
+            GEO_DL_BY="$(tr -dc '0-9' < "$GEO_PENDING" 2>/dev/null)"
+            GEO_DL_NOW="$(date +%s)"
+            if [ -n "$GEO_DL_BY" ] && [ "$GEO_DL_NOW" -ge "$GEO_DL_BY" ]; then
+                geo_strip_if_unsafe || true
+                rm -f "$GEO_PENDING"
+                exit 0
+            fi
+        fi
+        # SAFETY: only rewrite the rules when the allow-set could actually be
+        # rebuilt. At boot the ipset is recreated from scratch, so a failed
+        # rebuild means an empty set — writing the world-DROP rule then would
+        # lock the server out on every restart.
+        if geo_ipset_rebuild; then
+            geo_write_rules 2>/dev/null || true
+        else
+            geo_remove_rules
+            printf '%s SAFETY ipset rebuild empty at boot — geo rules left out, server open to all\n' \
+                "$(date '+%Y-%m-%d %H:%M:%S')" >> "$GEO_LOG"
+        fi
         ;;
     --health) geo_enabled ;;
-    *) die "usage: geoip.sh (--add <CC,..>|--remove <CC,..>|--list|--names|--cc-name <CC>|--enable|--disable|--bypass|--refresh|--health)" ;;
+    *) die "usage: geoip.sh (--add <CC,..>|--remove <CC,..>|--list|--names|--cc-name <CC>|--enable|--confirm|--panic|--disable|--bypass|--refresh|--health)" ;;
 esac

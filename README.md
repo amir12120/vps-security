@@ -13,7 +13,7 @@
 5. **Bot & Scanner Shield** — per-IP connection rate limits, TCP-flag scan drops (NULL / SYN+FIN / SYN+RST / ALL), and SYN-flood **detection**: a flooding IP is queued for your decision instead of being banned behind your back
 6. **Approval workflow** — pending alerts appear at every SSH login, in the menu title and in the dashboard; `sudo vpssec alerts` asks you one by one: *“IP 203.0.113.5 (Netherlands) is hitting port 22 — ban it?”*. Approve → banned for **24 hours**; release it again whenever you like, so a wrong call is always recoverable
 7. **Maintenance** — every 2 days clears the RAM cache (`drop_caches`), removes rotated logs, truncates active system logs, and vacuums the systemd journal (size **and** age capped). Optional swap clear is **off by default**; toggle it from the Maintenance menu or `MAINT_CLEAR_SWAP=1` in `/etc/vps-security/maintain.conf`. vps-security's own logs and any directory under `/var/log` are never touched, and you can exclude extra files via the menu or `MAINT_EXCLUDE`
-8. **GeoIP country filter** — allow **any number of countries** you choose (e.g. only Iran and Germany) and block every other country from reaching the server
+8. **GeoIP country allow-list** — allow **any number of countries** you choose (e.g. only Iran and Germany) and block every other country from reaching the server. It is a whitelist: only the countries you add may connect. Four independent safety layers mean a wrong list can never cost you SSH permanently — see [GeoIP country allow-list](#geoip-country-filter)
 
 ---
 
@@ -32,7 +32,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.6.0 — server hardening toolkit
+  vps-security v1.7.0 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────
@@ -48,7 +48,7 @@ sudo vpssec
     ⬆️  Update vps-security
     🧹 Maintenance — RAM cache & log cleanup
     🛡️  Bot & Scanner Shield
-    🌍 GeoIP country filter
+    🌍 GeoIP country allow-list
     🏁 The best Iranian mirror & DNS
     🗑️  Uninstall vps-security
     🚪 Exit
@@ -73,7 +73,10 @@ Navigate with **↑/↓** (or `j`/`k`), select with **Enter**, go back with **q*
 | `sudo vpssec maint status` | Maintenance timer state + recent runs |
 | `sudo vpssec maint` | Maintenance menu: run now, toggle swap clear, journal caps, skip list |
 | `sudo vpssec shield status` | Bot & Scanner Shield state + banned IPs |
-| `sudo vpssec geo list` | GeoIP filter configuration |
+| `sudo vpssec geo list` | GeoIP allow-list configuration |
+| `sudo vpssec geo confirm` | Keep a country-filter change (stops the automatic re-open) |
+| `sudo vpssec geo panic` | Remove the country filter right now |
+| `sudo vpssec rescue` | **Locked out?** Remove the country filter, release every blocked port, turn the shield off and open the SSH port — run it from the provider console |
 | `sudo vpssec mirror` | **The best Iranian mirror & DNS:** times every Iranian GitHub mirror, every Iranian resolver and every apt mirror from this server, then installs the fastest of each system-wide — criterion: real GitHub / apt access speed |
 | `sudo vpssec logs [n]` | Show monitor log |
 | `sudo vpssec uninstall` | **Full cleanup:** removes everything, restores SSH to port 22, resets & disables ufw (keeping SSH reachable) |
@@ -203,20 +206,51 @@ From the **🌍 GeoIP country filter** menu (or `vpssec geo ...`):
    - short forms and obvious typos: `netherland`, `nederlands`, `germny`, `qater` all resolve
    - Unknown or **ambiguous** entries change nothing and print a hint: `'Turk' is not a valid country code or name … Did you mean: TR (turkey), TM (turkmenistan) ?`
    - Not sure of a code? **📖 Country codes & names** in the menu (or `vpssec geo names`) prints the whole code/name/alias table.
-2. **✅ Enable filtering** — downloads each country's IPv4 CIDR list (IPFire location database, updated daily), loads them into an **ipset**, and wires ufw so that *only* those countries can reach the server — everyone else is dropped
-3. **🛟 Bypass** — add your own IP so it is never geo-blocked, even from a blocked country (the menu shows your current public IP)
-4. **♻️ Refresh** — country lists refresh automatically every week; refresh manually any time
-5. **⛔ Disable** — removes all geo rules instantly; everyone can connect again
+2. **✅ Enable** — downloads each country's IPv4 CIDR list (IPFire location database, updated daily), loads them into an **ipset**, and wires ufw so that *only* those countries can reach the server — everyone else is dropped
+3. **✔️ Confirm** — keeps the change. If you never confirm, the filter removes itself (see below)
+4. **🛟 Bypass** — add your own IP so it is never geo-blocked, even from a blocked country. The menu offers **the IP you are connected from**
+5. **♻️ Refresh** — country lists refresh automatically every week; refresh manually any time
+6. **⛔ Disable** — removes all geo rules instantly; everyone can connect again
 
-Direct commands: `vpssec geo add IR,DE` (codes, full names, or Persian names) · `vpssec geo remove TR` · `vpssec geo names` (lookup table) · `vpssec geo list` · `vpssec geo enable|disable` · `vpssec geo bypass <ip>` · `vpssec geo refresh`
+Direct commands: `vpssec geo add IR,DE` (codes, full names, or Persian names) · `vpssec geo remove TR` · `vpssec geo names` (lookup table) · `vpssec geo list` · `vpssec geo enable` · `vpssec geo confirm` · `vpssec geo disable` · `vpssec geo panic` · `vpssec geo bypass <ip>` · `vpssec geo refresh`
 
-> ⚠️ Enable GeoIP filtering **after** confirming your SSH connectivity, and add your own IP as a bypass if you connect from a country you did not whitelist.
+### SSH can never be locked out permanently
 
-> 🛡️ **Built-in safety — you can never lock the whole world out by accident:**
+> ⚠️ **This feature is an ALLOW-LIST.** The countries you add are the *only* ones that may connect; every other country is blocked. It is **not** a list of countries to block. If you connect from Iran, `IR` must be on the list (or your IP must be bypassed).
+
+The filter is wrapped in five independent safety layers, each of which exists because a wrong allow-list would otherwise mean a rebuild:
+
+| # | Guarantee |
+|---|---|
+| 1 | **Every** configured country must have a downloaded range list. A partial download — e.g. your own country failing while another one succeeds — makes `enable` refuse instead of installing a ruleset that allows only the *other* country |
+| 2 | The IP you are **connected from** is added to the never-block list automatically when it is not covered by an allowed country, and verified against the ipset |
+| 3 | A **confirmation window** (10 min by default): unless you run `vpssec geo confirm`, the filter removes itself and the server re-opens. Losing SSH therefore costs you ten minutes, not a rebuild |
+| 4 | The allow-set must **actually hold ranges**: if nothing can be loaded into the ipset (kernel module, memory), the change is refused — and at boot the rules are left out — because an empty set plus the world-DROP rule is a lockout |
+| 5 | `vpssec geo panic` strips the country filter from any console, no questions asked |
+
+And if you are already locked out with only a provider console:
+
+```bash
+sudo vpssec rescue      # country filter off + every blocked port released + shield off + SSH port opened
+```
+
+> 🛡️ **Other safety rails:**
 > - If **no countries are configured**, enabling the filter is refused and the server stays reachable from **everywhere**.
 > - If every country-list **download fails**, the blocking rules are never installed.
+> - A **transient download failure never deletes a working list** — the cached ranges stay in use.
+> - **Declared tunnel ports** are exempt from the country filter, so a reverse tunnel dialled in from abroad keeps working.
 > - **Removing the last allowed country** while filtering is active automatically disables the filter and re-opens the server to all countries.
-> - **At boot**, an unsafe config (no countries / empty lists / no bypass) never re-applies the world-DROP rule.
+> - **At boot**, an unsafe config (no countries / empty lists) never re-applies the world-DROP rule, and an expired unconfirmed change is not restored.
+
+### If you ever lose SSH again, check these in order
+
+With console access, the fastest path is `sudo vpssec rescue`, then investigate:
+
+1. `vpssec geo list` — is the filter on, and which countries does it allow? `vpssec geo panic` turns it off.
+2. `ufw status` — is the SSH port allowed? `ss -tlnp | grep sshd` — is sshd listening, and on which port?
+3. `vpssec shield status` — a shield ban can drop your IP for 24 h: `vpssec shield unban <ip>`.
+4. `vpssec blocked` — ports the monitor firewalled; `vpssec unblock <port>` releases one.
+5. `systemctl status ssh sshd` and `journalctl -u ssh -n 50` — confirms whether the problem was the network at all.
 
 ## Files and paths
 
@@ -277,7 +311,7 @@ It stays local-only by default — do not expose it publicly without an authenti
 Nothing here touches the machine it runs on: `ufw`, `ss`, `systemctl`, `apt-get`, `ipset` and `curl` are `PATH`-stubbed and every path is redirected into a temp sandbox.
 
 ```bash
-bash test/smoke.sh              # 298 checks: full install, alert detection + approval, ban expiry, shield, GeoIP, maintenance, GitHub mirror / DNS / apt mirror (incl. rollback), symlinked CLI, TUI frames, uninstall
+bash test/smoke.sh              # 326 checks: full install, alert detection + approval, ban expiry, shield, GeoIP allow-list (incl. the empty-ipset safety), maintenance, GitHub mirror / DNS / apt mirror (incl. rollback), symlinked CLI, TUI frames, uninstall
                                 # (a Linux host adds the pty menu checks, the interactive y/n approval and the live guard API checks)
 bash test/simulate-two-host.sh  #  76 checks: two simulated servers (Iran + foreign) with a 3x-ui panel and a backpack tunnel
 ```

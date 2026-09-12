@@ -107,8 +107,25 @@ EOF
         > "$H/stubs/systemctl"
     printf '#!/usr/bin/env bash\necho "apt-get \$*" >> "%s"\nexit 0\n' "$H/logs/apt.log" \
         > "$H/stubs/apt-get"
-    printf '#!/usr/bin/env bash\necho "ipset \$*" >> "%s"\nexit 0\n' "$H/logs/ipset.log" \
-        > "$H/stubs/ipset"
+    # Stateful ipset stub: `list` must reflect what was added, because the
+    # geo code refuses to install the world-DROP rule over an empty allow-set.
+    cat > "$H/stubs/ipset" <<EOF
+#!/usr/bin/env bash
+echo "ipset \$*" >> "$H/logs/ipset.log"
+STORE="$H/ipset.store"
+case "\$1" in
+    test)    case "\$3" in 1.2.3.*) exit 0 ;; *) exit 1 ;; esac ;;
+    create)  : > "\$STORE"; exit 0 ;;
+    destroy) rm -f "\$STORE"; exit 0 ;;
+    add)     [ -f "\$STORE" ] || exit 1
+             case "\$3" in *[!0-9./]*) exit 1 ;; esac
+             grep -qx "\$3" "\$STORE" 2>/dev/null || echo "\$3" >> "\$STORE"
+             exit 0 ;;
+    list)    [ -f "\$STORE" ] || exit 1
+             echo "Members:"; cat "\$STORE"; exit 0 ;;
+esac
+exit 0
+EOF
     printf '#!/usr/bin/env bash\nexit 0\n' > "$H/stubs/sshd"
     # ---- curl: country list download ------------------------
     cat > "$H/stubs/curl" <<'EOF'
