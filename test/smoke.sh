@@ -395,6 +395,14 @@ echo "=== smoke: alert wording, country lookup and login notice ==="
 # without any network access (the GeoIP feature downloads these files).
 mkdir -p "$VPSSEC_STATE_DIR/geo"
 printf '9.9.9.0/24\n' > "$VPSSEC_STATE_DIR/geo/NL.cidr"
+# Source 1 of the lookup: geoiplookup. Stubbed so this check runs on every
+# platform instead of only where geoip-bin happens to be installed.
+cat > "$STUBS/geoiplookup" <<'GEOEOF'
+#!/usr/bin/env bash
+echo "GeoIP Country Edition: NL, Netherlands"
+exit 0
+GEOEOF
+chmod +x "$STUBS/geoiplookup"
 rm -f "$VPSSEC_STATE_DIR/pending-alerts.list" "$VPSSEC_STATE_DIR/alerts.log"
 bash "$HERE/lib/alerts.sh" --report ip 9.9.9.4 22 "45 new connections in 30s" > "$SANDBOX/report.out" 2>&1 || true
 check "report queues the offending IP"    "grep -qE '^[0-9]+\|ip\|9.9.9.4\|' '$VPSSEC_STATE_DIR/pending-alerts.list'"
@@ -402,14 +410,24 @@ check "notification names the port"       "grep -q 'port 22' '$SANDBOX/report.ou
 check "notification says nothing is blocked" "grep -q 'Nothing was blocked' '$SANDBOX/report.out'"
 check "notification points at the reviewer" "grep -q 'vpssec alerts' '$SANDBOX/report.out'"
 check "report is recorded in alerts.log"  "grep -q 'DETECTED ip 9.9.9.4' '$VPSSEC_STATE_DIR/alerts.log'"
+check "country is resolved"                "[ \"$(bash "$HERE/lib/alerts.sh" --get 1 | cut -d'|' -f4)\" = \"NL\" ]"
+check "describe names the country"         "bash '$HERE/lib/alerts.sh' --describe 1 | grep -q 'Netherlands'"
+check "geoip.sh --cc-name works"           "[ \"$(bash "$HERE/lib/geoip.sh" --cc-name NL)\" = \"netherlands\" ]"
 
+# Source 2: the offline country CIDR lists, resolved with python3. The
+# geoiplookup stub is dropped from PATH so this exercises the fallback.
 if python3 -c 'print(1)' >/dev/null 2>&1; then
-    check "country is resolved offline"    "[ \"$(bash "$HERE/lib/alerts.sh" --get 1 | cut -d'|' -f4)\" = \"NL\" ]"
-    check "describe names the country"     "bash "$HERE/lib/alerts.sh" --describe 1 | grep -q 'Netherlands'"
-    check "geoip.sh --cc-name works"       "[ \"$(bash "$HERE/lib/geoip.sh" --cc-name NL)\" = \"netherlands\" ]"
+    NO_GEO_STUB="$(printf '%s' "$PATH" | sed "s|$STUBS:||")"
+    rm -f "$VPSSEC_STATE_DIR/pending-alerts.list"
+    PATH="$NO_GEO_STUB" bash "$HERE/lib/alerts.sh" --report ip 9.9.9.5 22 "offline lookup" >/dev/null 2>&1 || true
+    check "country also resolves from the CIDR lists" "[ \"$(bash "$HERE/lib/alerts.sh" --get 1 | cut -d'|' -f4)\" = \"NL\" ]"
 else
-    echo "  skip- country lookup (python3 not available)"
+    echo "  skip- offline CIDR country lookup (python3 not available)"
 fi
+
+# put the known alert back for the login-notice checks below
+rm -f "$VPSSEC_STATE_DIR/pending-alerts.list"
+bash "$HERE/lib/alerts.sh" --report ip 9.9.9.4 22 "45 new connections in 30s" >/dev/null 2>&1 || true
 
 # The login notice is the notification the admin cannot miss
 MOTD="$(VPSSEC_STATE_DIR="$VPSSEC_STATE_DIR" bash "$HERE/scripts/motd-alerts.sh" 2>&1 || true)"
@@ -668,7 +686,7 @@ if command -v script >/dev/null 2>&1; then
         # is firewalled, and only "y" applies the ban.
         rm -f "$SANDBOX/ufw.log" "$VPSSEC_STATE_DIR/pending-alerts.list"
         bash "$HERE/lib/alerts.sh" --report port 9876 9876 "rogue service carrying traffic" >/dev/null 2>&1 || true
-        printf 'y\nq\n' | TERM=xterm timeout 30 \
+        printf 'y\nq\n' | TERM=xterm UFW_LOG="$SANDBOX/ufw.log" timeout 30 \
             script -qec "bash '$HERE/vpssec' alerts" /dev/null > "$SANDBOX/ptyapprove.out" 2>&1 || true
         check "approval prompt asks the admin to decide" "grep -q 'Block port 9876' '$SANDBOX/ptyapprove.out'"
         check "approval prompt offers y/n/s/a/q"         "grep -q 'y = yes' '$SANDBOX/ptyapprove.out'"

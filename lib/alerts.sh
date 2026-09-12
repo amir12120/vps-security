@@ -114,7 +114,9 @@ country_name() {
     [ -z "$cc" ] && return 0
     case "$cc" in -|unknown) return 0 ;; esac
     name="$(bash "$SCRIPT_DIR/lib/geoip.sh" --cc-name "$cc" 2>/dev/null | head -1)"
-    printf '%s' "${name:-$cc}"
+    # The country table stores lowercase names; a ban prompt reads better as
+    # "IP 203.0.113.5 (Netherlands) is flooding port 22".
+    printf '%s' "${name:-$cc}" | awk '{ print toupper(substr($0, 1, 1)) substr($0, 2) }'
 }
 
 # ---------- the queue ----------
