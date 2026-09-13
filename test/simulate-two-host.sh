@@ -351,7 +351,12 @@ rm -f "$ROOT/iran/logs/ufw.log" "$H_iran/state/shield-bans.list" "$H_iran/state/
 SS_SYN_FLOOD="$ATTACKER" SS_SYN_FLOOD_PORT=443 on iran bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
 check "iran: tunnel traffic is never mistaken for an attack" "! grep -q 'deny from $ATTACKER' '$ROOT/iran/logs/ufw.log' && ! grep -qE '^[0-9]+\|ip\|' '$H_iran/state/pending-alerts.list'"
 # the tunnel peer itself (GeoIP-trusted) is never reported either
-rm -f "$ROOT/iran/logs/ufw.log" "$H_iran/state/pending-alerts.list"
+rm -f "$ROOT/iran/logs/ufw.log" "$H_iran/state/pending-alerts.list" \
+      "$H_iran/state/shield-hits.list"
+# Clear the per-IP hit counters too: the attacker scenario above may have
+# run < SHIELD_WINDOW seconds ago on a fast machine, and its leftover hits
+# would make scan_and_ban re-report the ATTACKER here. This check is about
+# the trusted PEER only, so start from an empty counter state.
 SS_SYN_FLOOD="$FOREIGN_IP" SS_SYN_FLOOD_PORT=22 on iran bash "$HERE/lib/botshield.sh" --maint > /dev/null 2>&1 || true
 check "iran: trusted tunnel peer is never banned" "! grep -q 'deny from $FOREIGN_IP' '$ROOT/iran/logs/ufw.log'"
 check "iran: trusted tunnel peer is never reported" "! grep -qE '^[0-9]+\|ip\|' '$H_iran/state/pending-alerts.list'"
