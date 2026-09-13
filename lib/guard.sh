@@ -81,6 +81,7 @@ serve_one() {
     # Read request headers (and discard any body)
     # shellcheck disable=SC2034  # parsed for clarity; routing uses path
     local req line method path
+    # shellcheck disable=SC2034  # method parsed for clarity; routing uses path
     IFS=' ' read -r method path _ <&"$1" 2>/dev/null || return 0
     # consume remaining headers
     while IFS= read -r line <&"$1" && [ "$line" != $'\r' ] && [ -n "$line" ]; do :; done
