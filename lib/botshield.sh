@@ -1,27 +1,32 @@
 #!/usr/bin/env bash
 # ============================================================
-# vps-security — Bot & Scanner Shield
+# vps-security — Bot & Scanner Shield (fail2ban-style)
 #
-# Blocks unauthorized bots and scanners that use the server in
-# unusual ways:
-#   - Per-IP connection rate limits on the protected ports
-#     (ufw "limit": >6 new connections in 30s from one IP -> dropped)
-#   - TCP-flag scan drops (NULL / SYN+FIN / SYN+RST / ALL-flags)
-#   - Detection: an IP that crosses the rate threshold is reported as a
-#     pending alert (lib/alerts.sh). In the default MODE=approve nothing
-#     is banned until the administrator confirms; MODE=auto restores the
-#     old "ban immediately for BAN_SECONDS" behaviour.
+# The old design used `ufw limit`, which drops a source after ~6 NEW
+# connections in 30s. That is exactly what a busy tunnel looks like —
+# one peer IP opening a burst of connections — so enabling the shield
+# cut the admin's own VPN. It also rate-limited whole ports, so one
+# noisy customer could break the service for everyone.
 #
-# All rules are written through ufw so they survive reboots.
+# The new design is a classic fail2ban per-IP counter:
+#   - NO per-port rate limits at all — legitimate clients can never be
+#     crowded out by other users of the same port
+#   - the shield watches connections (via `ss`) and counts them PER IP
+#   - an IP that crosses SHIELD_THRESHOLD new connections to a
+#     PROTECTED port within the SHIELD_WINDOW is reported (approve mode)
+#     or banned (auto mode) — for BAN_SECONDS, releasable any time
+#   - tunnel ports, trusted tunnel peers (GeoIP bypass), local/private
+#     addresses and the admin's own SSH client are always exempt
+#   - TCP-flag scan drops stay as they are (harmless to tunnels)
 #
 # Usage:
-#   botshield.sh --enable [ports csv]   install rules
-#   botshield.sh --disable              remove all shield rules
+#   botshield.sh --enable [ports csv]   arm the shield
+#   botshield.sh --disable              remove all shield state
 #   botshield.sh --status               shield state + banned IPs
 #   botshield.sh --list                 list banned IPs
 #   botshield.sh --unban <ip>           release a banned IP now
 #   botshield.sh --ban-now <ip> [note]  ban an IP (used after an approval)
-#   botshield.sh --maint                ban-expiry maintenance (timer)
+#   botshield.sh --maint                counter/ban maintenance (timer)
 #   botshield.sh --health               exit 0 if shield enabled
 # ============================================================
 
@@ -33,7 +38,8 @@ BANS_FILE="$VPSSEC_STATE_DIR/shield-bans.list"
 BAN_LOG="$VPSSEC_STATE_DIR/shield-bans.log"
 SHIELD_LOG="$VPSSEC_STATE_DIR/shield.log"
 BAN_SECONDS="${BAN_SECONDS:-86400}"    # 24 hours default
-BAN_THRESHOLD="${BAN_THRESHOLD:-40}"   # alerts/bans raised when hits exceed this
+SHIELD_THRESHOLD="${SHIELD_THRESHOLD:-40}"  # new conns from ONE IP to trigger
+SHIELD_WINDOW="${SHIELD_WINDOW:-30}"   # seconds a hit stays in the counter
 SHIELD_MODE="${SHIELD_MODE:-approve}"  # approve | auto
 
 have_iptables() { command -v iptables >/dev/null 2>&1; }
@@ -56,6 +62,8 @@ SHIELD_ENABLED=${SHIELD_ENABLED:-0}
 SHIELD_PORTS=${SHIELD_PORTS:-}
 SHIELD_MODE=${SHIELD_MODE:-approve}
 BAN_SECONDS=${BAN_SECONDS:-86400}
+SHIELD_THRESHOLD=${SHIELD_THRESHOLD:-40}
+SHIELD_WINDOW=${SHIELD_WINDOW:-30}
 EOF
     chmod 600 "$SHIELD_CONF"
 }
@@ -142,34 +150,41 @@ remove_flag_drops() {
 }
 
 # ---------- rate limits ----------
+# None. `ufw limit` was removed on purpose: it counts NEW connections per
+# (port, source) pair and drops the source after ~6 in 30s — a busy tunnel
+# or one active VPN customer hits that instantly. Detection is per-IP and
+# threshold-based instead (scan_and_ban below).
 
-apply_limit_rules() {
-    local ports_csv="$1" ssh_port="$2" p
-    # SSH always gets a limit (brute-force protection)
-    [ -n "$ssh_port" ] && cmd_ufw limit "$ssh_port"/tcp >/dev/null 2>&1
-    IFS=',' read -ra plist <<< "$ports_csv"
-    for p in "${plist[@]:-}"; do
-        [ -z "$p" ] && continue
-        [ "$p" = "$ssh_port" ] && continue   # already limited above
-        port_is_tunnel "$p" && continue
-        cmd_ufw limit "$p"/tcp >/dev/null 2>&1
-        cmd_ufw limit "$p"/udp >/dev/null 2>&1
-    done
-    return 0
+# ---------- per-IP hit counters (the fail2ban part) ----------
+
+HITS_FILE="$VPSSEC_STATE_DIR/shield-hits.list"
+
+# Record one new connection: <unix-ts>|<ip>|<port>. Old entries are
+# pruned against SHIELD_WINDOW so the counter reflects "recent" activity.
+record_hit() {
+    local ip="$1" port="$2" now cutoff
+    now="$(date +%s)"
+    cutoff=$((now - SHIELD_WINDOW))
+    {
+        # keep only recent lines
+        while IFS='|' read -r ts h_ip h_port || [ -n "${ts:-}" ]; do
+            [ -z "${ts:-}" ] && continue
+            [ "$ts" -ge "$cutoff" ] 2>/dev/null && \
+                printf '%s|%s|%s\n' "$ts" "$h_ip" "$h_port"
+        done < "$HITS_FILE" 2>/dev/null || true
+        printf '%s|%s|%s\n' "$now" "$ip" "$port"
+    } > "$HITS_FILE.tmp" 2>/dev/null || : > "$HITS_FILE.tmp"
+    mv "$HITS_FILE.tmp" "$HITS_FILE"
 }
 
-remove_limit_rules() {
-    local ports_csv="$1" ssh_port="$2" p
-    [ -n "$ssh_port" ] && cmd_ufw delete limit "$ssh_port"/tcp >/dev/null 2>&1
-    IFS=',' read -ra plist <<< "$ports_csv"
-    for p in "${plist[@]:-}"; do
-        [ -z "$p" ] && continue
-        [ "$p" = "$ssh_port" ] && continue
-        port_is_tunnel "$p" && continue
-        cmd_ufw delete limit "$p"/tcp >/dev/null 2>&1
-        cmd_ufw delete limit "$p"/udp >/dev/null 2>&1
-    done
-    return 0
+# How many recent hits an IP has on a given port.
+hits_count() {
+    local ip="$1" port="$2" now cutoff
+    now="$(date +%s)"
+    cutoff=$((now - SHIELD_WINDOW))
+    awk -F'|' -v ip="$ip" -v port="$port" -v cutoff="$cutoff" \
+        '$1 >= cutoff && $2 == ip && $3 == port { n++ } END { print n + 0 }' \
+        "$HITS_FILE" 2>/dev/null
 }
 
 # ---------- bans ----------
@@ -233,14 +248,11 @@ ip_hits() {
     [ -f "$VPSSEC_STATE_DIR/shield-hits.log" ] && grep -cF "|$ip" "$VPSSEC_STATE_DIR/shield-hits.log" 2>/dev/null || echo 0
 }
 
-# Print "<local> <peer>" for every half-open (SYN-RECV) connection.
+# Print "<local> <peer>" for every NEW inbound TCP connection.
 #
 # NOTE: `ss -tan` prints no Netid column while `ss -tunap` does, so the
-# column positions differ. This used to read $1/$2 as "tcp"/"SYN-RECV"
-# (the -tunap layout) while reading $4/$5 as local/peer (the -tan layout),
-# which meant the auto-ban never matched a single connection. Both layouts
-# are accepted here.
-ss_syn_recv() {
+# column positions differ. Both layouts are accepted here.
+ss_new_conns() {
     ss -tan 2>/dev/null | awk '
         NR == 1 && ($1 == "State" || $1 == "Netid") { next }
         {
@@ -249,57 +261,67 @@ ss_syn_recv() {
             } else {
                 st = $1; l = $4; r = $5
             }
-            if (st == "SYN-RECV") print l " " r
+            if (st == "SYN-RECV" || st == "SYN-SENT" || st == "ESTAB") print l " " r
         }'
 }
 
-# Inspect recent connections (ss) and ban IPs with too many NEW
-# connections to protected ports.
+# Count hits per peer IP and act when one crosses the threshold.
+# Only PROTECTED ports are counted; the caller has already excluded
+# tunnel ports from that list, and ban_ip refuses local/trusted peers.
 scan_and_ban() {
     command -v ss >/dev/null 2>&1 || return 0
     # zombie guard: never scan/ban while the shield is disabled
     shield_is_enabled || return 0
     load_shield_conf
     load_tunnel_ports
-    local hits ports_csv
+    local ports_csv
     ports_csv="$(shield_ports "$SHIELD_PORTS")"
     [ -z "$ports_csv" ] && return 0
 
-    local pairs
-    pairs="$(ss_syn_recv)"
-    [ -z "$pairs" ] && return 0
+    # 1. feed the counters with the connections we see right now
+    local pairs l_port ip
+    pairs="$(ss_new_conns)"
+    [ -n "$pairs" ] && while read -r l r; do
+        [ -z "${l:-}" ] && continue
+        l_port="$(printf '%s' "$l" | sed -E 's/.*[:.]([0-9]+)$/\1/')"
+        case ",$ports_csv," in *",$l_port,"*) ;; *) continue ;; esac
+        ip="$(printf '%s' "$r" | sed -E 's/^\[?([0-9a-fA-F:.]+)\]?:[0-9]+$/\1/')"
+        [ -n "$ip" ] && record_hit "$ip" "$l_port"
+    done <<< "$pairs"
 
-    local syn_ports sp_port ip
-    syn_ports="$(printf '%s\n' "$pairs" | awk '{print $1}' \
-        | sed -E 's/.*[:.]([0-9]+)$/\1/' | sort -u || true)"
-    [ -z "$syn_ports" ] && return 0
+    # 2. any protected port where SOMEONE is connecting right now?
+    [ -n "$pairs" ] || pairs="$(ss_syn_recv)"
+    local act_ports
+    act_ports="$(printf '%s\n' "$pairs" | awk '{print $1}' \
+        | sed -E 's/.*[:.]([0-9]+)$/\1/' | sort -u \
+        | while IFS= read -r p; do
+            case ",$ports_csv," in *",$p,"*) echo "$p" ;; esac
+          done)"
+    [ -z "$act_ports" ] && return 0
 
-    for sp_port in $syn_ports; do
-        case ",$ports_csv," in
-            *",$sp_port,"*) ;;
-            *) continue ;;
-        esac
-        # offending peer IPs on that port (ban_ip itself refuses
-        # loopback/private/trusted peers)
-        for ip in $(printf '%s\n' "$pairs" \
-            | awk -v P=":$sp_port" '$1 ~ P {print $2}' \
-            | sed -E 's/^\[?([0-9a-fA-F:.]+)\]?:[0-9]+$/\1/' | sort | uniq -c \
-            | awk -v T="$BAN_THRESHOLD" '$1 >= T {print $2}'); do
-            hits="$(printf '%s\n' "$pairs" \
-                | awk -v P=":$sp_port" -v IP="$ip" '$1 ~ P && $2 ~ IP' | wc -l)"
+    # 3. per-IP counters on those ports (from the hits file, not from the
+    #    instantaneous socket table — that is what makes this fail2ban
+    #    rather than a single-snapshot guess)
+    local sp_port hit_ip hits
+    for sp_port in $act_ports; do
+        while read -r hit_ip; do
+            [ -z "$hit_ip" ] && continue
+            hits="$(hits_count "$hit_ip" "$sp_port")"
+            [ "$hits" -ge "$SHIELD_THRESHOLD" ] || continue
             if [ "$SHIELD_MODE" = "auto" ]; then
-                ban_ip "$ip" "$hits"
+                ban_ip "$hit_ip" "$hits"
             else
                 # Approval mode: report the IP and let the admin decide.
                 # A monitor, a backup host or a tunnel peer can look exactly
                 # like a flood, and an autonomous ban of one of those is very
                 # hard to notice from the outside.
                 printf '%s DETECT %s (hits=%s on port %s — awaiting approval)\n' \
-                    "$(date '+%Y-%m-%d %H:%M:%S')" "$ip" "$hits" "$sp_port" >> "$SHIELD_LOG"
-                bash "$SCRIPT_DIR/lib/alerts.sh" --report ip "$ip" "$sp_port" \
-                    "$hits new connections to port $sp_port in 30s" || true
+                    "$(date '+%Y-%m-%d %H:%M:%S')" "$hit_ip" "$hits" "$sp_port" >> "$SHIELD_LOG"
+                bash "$SCRIPT_DIR/lib/alerts.sh" --report ip "$hit_ip" "$sp_port" \
+                    "$hits connections to port $sp_port within ${SHIELD_WINDOW}s" || true
             fi
-        done
+        done < <(awk -F'|' -v P="$sp_port" '{ print $2 }' "$HITS_FILE" 2>/dev/null \
+            | sort -u)
     done
     return 0
 }
@@ -315,11 +337,6 @@ shield_enable() {
     SHIELD_ENABLED=1
     save_shield_conf
 
-    local sp
-    sp="$(grep -E '^\s*Port\s+' "${VPSSEC_SSHD_CONFIG:-/etc/ssh/sshd_config}" 2>/dev/null | tail -1 | awk '{print $2}')"
-    [ -z "$sp" ] && sp="22"
-
-    apply_limit_rules "$SHIELD_PORTS" "$sp"
     write_flag_drops
     if have_iptables && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -qx 'Status: active'; then
         ufw reload >/dev/null 2>&1 || true
@@ -351,22 +368,22 @@ EOF
 
     printf '%s shield enabled (ports: %s, ssh: %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${SHIELD_PORTS:-(none)}" "$sp" >> "$SHIELD_LOG"
     ok "Bot & Scanner Shield enabled."
-    ok "  rate limit  : ufw limit on SSH and protected ports (>6 new conns/30s dropped)"
+    ok "  detection   : per-IP — more than $SHIELD_THRESHOLD connections to a"
+    ok "                protected port within ${SHIELD_WINDOW}s is an attack"
     ok "  scan drops  : NULL / SYN+FIN / SYN+RST / ALL-flag packets dropped"
+    ok "  tunnels     : declared tunnel ports and trusted peers are exempt"
+    ok "  no ufw limit: legitimate clients are never rate-limited"
     if [ "$SHIELD_MODE" = "auto" ]; then
-        ok "  auto-ban    : SYN-flood IPs banned for $((BAN_SECONDS / 3600))h without asking"
+        ok "  auto-ban    : flooding IPs banned for $((BAN_SECONDS / 3600))h without asking"
     else
-        ok "  detection   : SYN-flood IPs are reported for your approval (no ban yet)"
-        ok "  ban window  : $((BAN_SECONDS / 3600))h once you approve (vpssec alerts)"
+        ok "  approve     : flooding IPs are reported; you decide (vpssec alerts)"
+        ok "  ban window  : $((BAN_SECONDS / 3600))h once you approve"
     fi
     ok "  maintenance : timer every 10 min (ban expiry)"
 }
 
 shield_disable() {
     load_shield_conf
-    local sp
-    sp="$(grep -E '^\s*Port\s+' "${VPSSEC_SSHD_CONFIG:-/etc/ssh/sshd_config}" 2>/dev/null | tail -1 | awk '{print $2}')"
-    [ -z "$sp" ] && sp="22"
     # SAFETY: release ALL active bans first — the maintenance timer that
     # expires bans is being removed, so without this every banned IP
     # would stay banned forever with no expiry mechanism.
@@ -377,7 +394,7 @@ shield_disable() {
             unban_ip "$ip"
         done < "$BANS_FILE"
     fi
-    remove_limit_rules "$SHIELD_PORTS" "$sp"
+    rm -f "$HITS_FILE" "$HITS_FILE.tmp"
     remove_flag_drops
     if have_iptables && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -qx 'Status: active'; then
         ufw reload >/dev/null 2>&1 || true
@@ -406,6 +423,7 @@ shield_status() {
     else
         echo "Mode         : approve (ask the admin before banning)"
     fi
+    echo "Trigger      : >$SHIELD_THRESHOLD conns / ${SHIELD_WINDOW}s from one IP"
     echo "Ban duration : ${BAN_SECONDS}s"
     echo "Banned IPs   : $(bans_count)"
     echo "Awaiting your approval: $(bash "$SCRIPT_DIR/lib/alerts.sh" --count 2>/dev/null || echo 0)"

@@ -23,7 +23,18 @@ declare -a FAILURES=()
 
 check() {
     local name="$1" cond="$2"
-    if eval "$cond"; then
+    # Watchdog (CI only, SSMOKE_WATCHDOG=1): a hung condition becomes a FAIL
+    # instead of stalling the suite forever. Conditions see the harness's
+    # variables because they are handed to the child via the environment.
+    # NOT enabled by default: MSYS/Git-Bash `timeout` reports wrong exit
+    # statuses for `bash -c`, which would fail every check on Windows.
+    local rc=1
+    if [ "${SSMOKE_WATCHDOG:-0}" = "1" ]; then
+        COND="$cond" timeout 20 bash -c 'eval "$COND"' || rc=$?
+    else
+        eval "$cond"; rc=$?
+    fi
+    if [ "$rc" -eq 0 ]; then
         PASS=$((PASS + 1))
         echo "  ok  - $name"
     else
@@ -346,6 +357,7 @@ check "alerts list says nothing is blocked" "grep -q 'nothing is blocked yet' '$
 check "alerts count reports 2"              "[ \"$(bash "$HERE/lib/alerts.sh" --count)\" -eq 2 ]"
 
 PICK="$(bash "$HERE/lib/alerts.sh" --get 1 | cut -d'|' -f3)"
+export PICK
 rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/vpssec" alerts approve 1 > "$SANDBOX/approve.out" 2>&1 || true
 check "approve blocks exactly that port"  "grep -q 'deny $PICK/tcp' '$SANDBOX/ufw.log'"
@@ -391,6 +403,7 @@ sed -i 's/^MONITOR_MODE=.*/MONITOR_MODE=approve/' "$VPSSEC_CONF_DIR/monitor.conf
 rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/monitor.sh" --block-now 3333 > "$SANDBOX/blockown.out" 2>&1
 BLOCK_OWN_RC=$?
+export BLOCK_OWN_RC
 check "block-now refuses the SSH port"     "[ \"$BLOCK_OWN_RC\" -ne 0 ] && grep -q 'was NOT blocked' '$SANDBOX/blockown.out'"
 check "refused block writes no ufw rule"   "! grep -q 'deny 3333' '$SANDBOX/ufw.log'"
 
@@ -434,8 +447,10 @@ echo "=== smoke: suite self-lint ==="
 # silently "passes". This lint keeps that class of false green out of the suite.
 RISKY_PATTERN='\\|'
 SELF_RISKY=$(grep -F "$RISKY_PATTERN" "$HERE/test/smoke.sh" 2>/dev/null | grep -c '^check ' || true)
+export SELF_RISKY
 check "no double-escaped patterns in conditions" "[ \"${SELF_RISKY:-0}\" -eq 0 ]"
 RISKY_LIB=$(grep -F "$RISKY_PATTERN" "$HERE/test/simulate-two-host.sh" 2>/dev/null | grep -c '^check ' || true)
+export RISKY_LIB
 check "no double-escaped patterns in the simulation" "[ \"${RISKY_LIB:-0}\" -eq 0 ]"
 
 # A condition that errors out is never a real result: fail loudly instead.
@@ -483,12 +498,14 @@ bash "$HERE/lib/alerts.sh" --report ip 9.9.9.4 22 "45 new connections in 30s" >/
 
 # The login notice is the notification the admin cannot miss
 MOTD="$(VPSSEC_STATE_DIR="$VPSSEC_STATE_DIR" bash "$HERE/scripts/motd-alerts.sh" 2>&1 || true)"
+export MOTD
 check "login notice reports the count"   "printf '%s' \"\$MOTD\" | grep -q '1 suspicious network event'"
 check "login notice names the offender"  "printf '%s' \"\$MOTD\" | grep -q '9.9.9.4'"
 check "login notice says nothing is blocked" "printf '%s' \"\$MOTD\" | grep -q 'nothing is blocked yet'"
 check "login notice tells how to review" "printf '%s' \"\$MOTD\" | grep -q 'vpssec alerts'"
 rm -f "$VPSSEC_STATE_DIR/pending-alerts.list"
 MOTD_EMPTY="$(VPSSEC_STATE_DIR="$VPSSEC_STATE_DIR" bash "$HERE/scripts/motd-alerts.sh" 2>&1 || true)"
+export MOTD_EMPTY
 check "login notice is silent when clear" "[ -z \"\$(printf '%s' \"\$MOTD_EMPTY\" | tr -d '[:space:]')\" ]"
 rm -rf "$VPSSEC_STATE_DIR/geo"
 
@@ -769,11 +786,11 @@ printf '8080\n' > "$VPSSEC_CONF_DIR/tunnel-ports.list"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --enable "443,8080" > "$SANDBOX/shield.out" 2>&1 || true
 SP="$(grep -E '^Port ' "$SSH_CFG" | tail -1 | awk '{print $2}')"; [ -z "$SP" ] && SP=22
 check "shield enabled"                  "grep -q 'Shield enabled' '$SANDBOX/shield.out'"
-check "shield rate-limits protected port" "grep -q 'limit 443/tcp' '$SANDBOX/ufw.log'"
-check "tunnel port is NEVER rate-limited" "! grep -q 'limit 8080/' '$SANDBOX/ufw.log'"
+check "shield conf records protected ports" "grep -q 'SHIELD_PORTS=' '$VPSSEC_CONF_DIR/botshield.conf'"
+check "shield writes no ufw limit rules"    "! grep -q ' limit ' '$SANDBOX/ufw.log'"
 check "tunnel port kept out of shield list" "! grep -q '8080' '$VPSSEC_CONF_DIR/botshield.conf'"
 check "shield conf written"             "grep -q 'SHIELD_ENABLED=1' '$VPSSEC_CONF_DIR/botshield.conf'"
-check "shield ufw limit on ssh"         "grep -qE 'limit (${SP})/tcp' '$SANDBOX/ufw.log'"
+check "shield output explains per-IP trigger" "grep -q 'per-IP' '$SANDBOX/shield.out' && grep -q 'no ufw limit' '$SANDBOX/shield.out'"
 check "shield timer installed"          "[ -f '$VPSSEC_SYSTEMD_DIR/vps-security-shield.timer' ]"
 check "flag drops written to before.rules" "grep -q 'vps-security botshield BEGIN' '$UFW_DIR/before.rules'"
 # ban an IP and check status/unban
@@ -800,7 +817,7 @@ check "disabled shield never bans (zombie guard)" "! grep -q 'deny from' '$SANDB
 
 check "shield conf records the approval mode" "grep -q 'SHIELD_MODE=approve' '$VPSSEC_CONF_DIR/botshield.conf'"
 check "shield conf records the 24h ban window" "grep -q 'BAN_SECONDS=86400' '$VPSSEC_CONF_DIR/botshield.conf'"
-check "shield output explains detection"      "grep -q 'for your approval' '$SANDBOX/shield.out'"
+check "shield output explains detection"      "grep -q 'reported; you decide' '$SANDBOX/shield.out'"
 
 # ---- approval model: a flood is REPORTED, never banned by the machine ----
 printf 'GEO_ENABLED=0\nGEO_COUNTRIES=\nGEO_BYPASS=198.51.100.7\n' > "$VPSSEC_CONF_DIR/geo.conf"
@@ -836,6 +853,7 @@ check "an approved ban can be released"     "grep -q 'delete deny from 203.0.113
 rm -f "$SANDBOX/ufw.log"
 UFW_LOG="$SANDBOX/ufw.log" bash "$HERE/lib/botshield.sh" --ban-now 10.0.0.5 > "$SANDBOX/bannow.out" 2>&1
 BAN_NOW_RC=$?
+export BAN_NOW_RC
 check "ban-now refuses a private peer"     "[ \"$BAN_NOW_RC\" -ne 0 ]"
 check "refusal is reported, not hidden"    "grep -q 'was NOT banned' '$SANDBOX/bannow.out'"
 check "refused ban writes no ufw rule"     "! grep -q 'deny from 10.0.0.5' '$SANDBOX/ufw.log'"

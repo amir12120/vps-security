@@ -330,8 +330,8 @@ rm -f "$ROOT/iran/logs/ufw.log" "$ROOT/foreign/logs/ufw.log"
 printf 'GEO_ENABLED=0\nGEO_COUNTRIES=\nGEO_BYPASS=%s\n' "$FOREIGN_IP" > "$H_iran/etc/geo.conf"
 on iran bash "$HERE/lib/botshield.sh" --enable "443,2086,2098,2689" > "$ROOT/iran/shield.out" 2>&1 || true
 check "iran: shield enabled"                   "grep -q 'Shield enabled' '$ROOT/iran/shield.out'"
-check "iran: ssh 22 is rate-limited"           "grep -q 'limit 22/tcp' '$ROOT/iran/logs/ufw.log'"
-check "iran: tunnel entry 443 NOT rate-limited" "! grep -q 'limit 443/' '$ROOT/iran/logs/ufw.log'"
+check "iran: shield writes no ufw limit rules" "! grep -q ' limit ' '$ROOT/iran/logs/ufw.log'"
+check "iran: shield output names the per-IP trigger" "grep -q 'per-IP' '$ROOT/iran/shield.out'"
 check "iran: shield conf excludes the tunnel"  "grep -q 'SHIELD_ENABLED=1' '$H_iran/etc/botshield.conf'"
 # a real attacker brute-forcing SSH is REPORTED, never banned automatically
 rm -f "$ROOT/iran/logs/ufw.log" "$H_iran/state/shield-bans.list" "$H_iran/state/pending-alerts.list"

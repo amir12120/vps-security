@@ -85,6 +85,7 @@ cmd_systemctl() { systemctl "$@"; }
 cmd_curl()      { curl -fsSL --max-time 120 "$@"; }
 
 # UDP client ports (DHCP, NTP, DHCPv6) that must never look like services
+UDP_CLIENT_PORTS="67 68 123 546 547"
 
 ensure_dirs() {
     mkdir -p "$VPSSEC_CONF_DIR" "$VPSSEC_STATE_DIR"

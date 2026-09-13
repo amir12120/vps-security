@@ -10,7 +10,7 @@
 2. **SSH port change** — moves SSH off port 22 to a port you choose (with automatic rollback if sshd fails to come back)
 3. **Firewall (ufw)** — installs ufw, opens **only** the ports you approve and enables it. You type the whole list in **one comma-separated answer** (`444,2086,2098,2689`) — every port is opened. If you specify **no ports at all**, the firewall is left **disabled** and the server stays open on every port
 4. **Rogue-port monitor** — every 30 minutes scans live connections and **reports** any port outside your allow-list that is actively transferring data — with the offending IP, its country and the port. It is blocked only after *you* approve it
-5. **Bot & Scanner Shield** — per-IP connection rate limits, TCP-flag scan drops (NULL / SYN+FIN / SYN+RST / ALL), and SYN-flood **detection**: a flooding IP is queued for your decision instead of being banned behind your back
+5. **Bot & Scanner Shield (fail2ban-style)** — per-IP connection counting with **no port rate limits at all** (`ufw limit` is gone: it throttled whole ports and cut tunnels/VPN), TCP-flag scan drops (NULL / SYN+FIN / SYN+RST / ALL), and flood **detection**: an IP crossing the per-IP threshold is queued for your decision instead of being banned behind your back
 6. **Approval workflow** — pending alerts appear at every SSH login, in the menu title and in the dashboard; `sudo vpssec alerts` asks you one by one: *“IP 203.0.113.5 (Netherlands) is hitting port 22 — ban it?”*. Approve → banned for **24 hours**; release it again whenever you like, so a wrong call is always recoverable
 7. **Maintenance** — every 2 days clears the RAM cache (`drop_caches`), removes rotated logs, truncates active system logs, and vacuums the systemd journal (size **and** age capped). Optional swap clear is **off by default**; toggle it from the Maintenance menu or `MAINT_CLEAR_SWAP=1` in `/etc/vps-security/maintain.conf`. vps-security's own logs and any directory under `/var/log` are never touched, and you can exclude extra files via the menu or `MAINT_EXCLUDE`
 8. **GeoIP country allow-list** — allow **any number of countries** you choose (e.g. only Iran and Germany) and block every other country from reaching the server. It is a whitelist: only the countries you add may connect. Four independent safety layers mean a wrong list can never cost you SSH permanently — see [GeoIP country allow-list](#geoip-country-filter)
@@ -32,7 +32,7 @@ sudo vpssec
 ```
 
 ```
-  vps-security v1.7.1 — server hardening toolkit
+  vps-security v1.8.0 — server hardening toolkit
 
   Main Menu
   ─────────────────────────────────────────────
@@ -157,7 +157,7 @@ These servers usually carry a tunnel, so nothing here may fight it. vps-security
 
 - **Outbound connections are never touched.** A tunnel that dials a foreign server, a panel API call, a `git fetch` — all use kernel-assigned ephemeral ports, and the monitor ignores them completely. (Older builds blocked those source ports, which throttled the tunnel and filled ufw with junk rules.)
 - **Declare your tunnel ports** — `sudo vpssec tunnels add 8443,51820` or **🔌 Ports → 🚇 Tunnel ports**. A declared port is opened in the firewall, **never** blocked by the monitor, and **never** rate-limited by the shield.
-- **The shield never throttles a tunnel.** `ufw limit` drops a source after ~6 new connections in 30 s, and a busy tunnel peer looks exactly like that — tunnel ports are excluded from `ufw limit` and from the auto-ban scan.
+- **The shield never throttles a port.** The old `ufw limit` dropped a source after ~6 new connections in 30 s — exactly what one busy tunnel peer or VPN customer produces — so enabling the shield could cut your own VPN. Rate limits are removed entirely; detection is per-IP via connection counting (`SHIELD_THRESHOLD` connections to a protected port within `SHIELD_WINDOW` seconds).
 - **Peers are never banned blindly.** The shield refuses to ban loopback, RFC1918/CGNAT/link-local addresses and anything on your GeoIP *never block* list (`vpssec geo bypass <ip>`) — add the tunnel peer's IP there.
 - **Loopback services and the DNS resolver** are never flagged; the GeoIP filter never touches loopback traffic.
 - **The country filter only drops NEW inbound connections** (`--ctstate NEW`, `! -i lo`). Replies to connections *your server* opened keep flowing, so enabling GeoIP cannot kill an outbound tunnel — no matter which country the foreign server sits in.
@@ -190,7 +190,7 @@ Enable it from the **🛡️ Bot & Scanner Shield** menu (or `vpssec shield enab
 - **Rate limiting** — ufw `limit` rules on SSH and every protected port: more than **6 new connections per 30 s** from one IP are dropped (this kills port scanners and brute-force bots). **Tunnel ports are excluded** — declare them with `vpssec tunnels add`.
 - **Ban safety** — IPs are never banned for loopback, private/CGNAT/link-local addresses, or peers on your GeoIP *never block* list; skips are logged.
 - **TCP-flag drops** — NULL scans, SYN+FIN, SYN+RST, and ALL-flags packets are dropped in ufw's `before.rules` (survives reboots and ufw reloads)
-- **Detection instead of auto-ban** — an IP flooding a protected port with half-open connections (40+ SYN-RECV) is **reported as a pending alert** (`sudo vpssec alerts`), not banned. Approving it applies `ufw deny from <ip>` for **24 hours** (`BAN_SECONDS` in `/etc/vps-security/botshield.conf`); bans expire automatically (10-minute maintenance timer) and can be released immediately. Your **SSH port is always included** in the scan, so SSH brute-force floods are caught too — while declared **tunnel ports are never rate-limited and never reported** (one busy tunnel peer would otherwise look like a flood)
+- **Detection instead of auto-ban** — an IP that opens more than `SHIELD_THRESHOLD` (default 40) connections to a protected port within `SHIELD_WINDOW` (default 30 s) is **reported as a pending alert** (`sudo vpssec alerts`), not banned. Approving it applies `ufw deny from <ip>` for **24 hours** (`BAN_SECONDS` in `/etc/vps-security/botshield.conf`); bans expire automatically (10-minute maintenance timer) and can be released immediately. Your **SSH port is always included** in the scan, so SSH brute-force floods are caught too — while declared **tunnel ports are never watched and never reported** (one busy tunnel peer would otherwise look like a flood). Legitimate clients are never rate-limited: there are no `ufw limit` rules at all
 - Manage banned IPs from the same menu: view the list with remaining time, or unban any IP instantly
 
 ## GeoIP country filter
@@ -260,7 +260,7 @@ With console access, the fastest path is `sudo vpssec rescue`, then investigate:
 | `/usr/local/share/vps-security/` | Installed libraries (monitor, guard, shield, geo, maintenance, mirror) |
 | `/etc/vps-security/allowed-ports.list` | Your approved ports |
 | `/etc/vps-security/monitor.conf` | Monitor config (self ports, `MONITOR_MODE`, `BLOCK_SECONDS`) |
-| `/etc/vps-security/botshield.conf` | Bot & Scanner Shield config (`SHIELD_MODE`, `BAN_SECONDS`) |
+| `/etc/vps-security/botshield.conf` | Bot & Scanner Shield config (`SHIELD_MODE`, `BAN_SECONDS`, `SHIELD_THRESHOLD`, `SHIELD_WINDOW`) |
 | `/etc/vps-security/geo.conf` | GeoIP config (countries, bypass IPs) |
 | `/etc/vps-security/mirror.conf` | Applied mirror & DNS choice |
 | `/var/lib/vps-security/pending-alerts.list` | Suspicious events **awaiting your approval** |
