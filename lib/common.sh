@@ -10,13 +10,18 @@ if [ -t 1 ]; then
     GREEN='\033[0;32m'
     YELLOW='\033[1;33m'
     CYAN='\033[0;36m'
-    # shellcheck disable=SC2034
+    # shellcheck disable=SC2034  # used by alerts.sh and vpssec via sourcing
     BOLD='\033[1m'
-    # shellcheck disable=SC2034
+    # shellcheck disable=SC2034  # used by alerts.sh and vpssec via sourcing
     DIM='\033[2m'
     RESET='\033[0m'
 else
-    RED='' GREEN='' YELLOW='' CYAN='' BOLD='' DIM='' RESET=''
+    RED='' GREEN='' YELLOW='' CYAN=''
+    # shellcheck disable=SC2034  # used by alerts.sh and vpssec via sourcing
+    BOLD=''
+    # shellcheck disable=SC2034  # used by alerts.sh and vpssec via sourcing
+    DIM=''
+    RESET=''
 fi
 
 info()  { printf "%b\n" "${CYAN}[i]${RESET} $*"; }
@@ -85,6 +90,8 @@ cmd_systemctl() { systemctl "$@"; }
 cmd_curl()      { curl -fsSL --max-time 120 "$@"; }
 
 # UDP client ports (DHCP, NTP, DHCPv6) that must never look like services
+# (referenced by lib/monitor.sh, which sources this file)
+# shellcheck disable=SC2034
 UDP_CLIENT_PORTS="67 68 123 546 547"
 
 ensure_dirs() {

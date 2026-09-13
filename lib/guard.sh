@@ -79,7 +79,7 @@ respond() {
 
 serve_one() {
     # Read request headers (and discard any body)
-    # shellcheck disable=SC2034  # req/method parsed for clarity; routing uses path
+    # shellcheck disable=SC2034  # parsed for clarity; routing uses path
     local req line method path
     IFS=' ' read -r method path _ <&"$1" 2>/dev/null || return 0
     # consume remaining headers
