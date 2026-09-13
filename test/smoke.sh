@@ -23,17 +23,12 @@ declare -a FAILURES=()
 
 check() {
     local name="$1" cond="$2"
-    # Watchdog (CI only, SSMOKE_WATCHDOG=1): a hung condition becomes a FAIL
-    # instead of stalling the suite forever. Conditions see the harness's
-    # variables because they are handed to the child via the environment.
-    # NOT enabled by default: MSYS/Git-Bash `timeout` reports wrong exit
-    # statuses for `bash -c`, which would fail every check on Windows.
+    # NOTE: conditions reference harness variables ($SANDBOX, $UFW_LOG, ...)
+    # that are deliberately NOT exported, so they can only be evaluated in
+    # this shell. Never run them via a child bash. A hung condition is
+    # bounded by the CI job-level timeout-minutes instead.
     local rc=1
-    if [ "${SSMOKE_WATCHDOG:-0}" = "1" ]; then
-        COND="$cond" timeout 20 bash -c 'eval "$COND"' || rc=$?
-    else
-        eval "$cond"; rc=$?
-    fi
+    eval "$cond"; rc=$?
     if [ "$rc" -eq 0 ]; then
         PASS=$((PASS + 1))
         echo "  ok  - $name"

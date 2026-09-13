@@ -36,7 +36,7 @@ jobs:
       - name: Run smoke test suite
         run: |
           chmod +x vpssec lib/*.sh test/*.sh scripts/*.sh
-          SSMOKE_WATCHDOG=1 bash test/smoke.sh
+          bash test/smoke.sh
 
       - name: Run two-host tunnel simulation (Iran + foreign, panel + backpack)
         run: |
